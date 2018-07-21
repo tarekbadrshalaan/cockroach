@@ -291,8 +291,11 @@ func (ri *RowInserter) InsertRow(
 		}
 	}
 
-	if checkFKs == CheckFKs {
-		if err := ri.Fks.checkAll(ctx, values); err != nil {
+	if ri.Fks.checker != nil && checkFKs == CheckFKs {
+		if err := ri.Fks.addAllIdxChecks(ctx, values); err != nil {
+			return err
+		}
+		if err := ri.Fks.checker.runCheck(ctx, nil, values); err != nil {
 			return err
 		}
 	}
@@ -815,7 +818,13 @@ func (ru *RowUpdater) UpdateRow(
 		}
 
 		if checkFKs == CheckFKs {
-			if err := ru.Fks.runIndexChecks(ctx, oldValues, ru.newValues); err != nil {
+			if err := ru.Fks.addIndexChecks(ctx, oldValues, ru.newValues); err != nil {
+				return nil, err
+			}
+			if !ru.Fks.hasFKs() {
+				return ru.newValues, nil
+			}
+			if err := ru.Fks.checker.runCheck(ctx, oldValues, ru.newValues); err != nil {
 				return nil, err
 			}
 		}
@@ -912,7 +921,13 @@ func (ru *RowUpdater) UpdateRow(
 	}
 
 	if checkFKs == CheckFKs {
-		if err := ru.Fks.runIndexChecks(ctx, oldValues, ru.newValues); err != nil {
+		if err := ru.Fks.addIndexChecks(ctx, oldValues, ru.newValues); err != nil {
+			return nil, err
+		}
+		if !ru.Fks.hasFKs() {
+			return ru.newValues, nil
+		}
+		if err := ru.Fks.checker.runCheck(ctx, oldValues, ru.newValues); err != nil {
 			return nil, err
 		}
 	}
@@ -1091,8 +1106,11 @@ func (rd *RowDeleter) DeleteRow(
 			return err
 		}
 	}
-	if checkFKs == CheckFKs {
-		return rd.Fks.checkAll(ctx, values)
+	if rd.Fks.checker != nil && checkFKs == CheckFKs {
+		if err := rd.Fks.addAllIdxChecks(ctx, values); err != nil {
+			return err
+		}
+		return rd.Fks.checker.runCheck(ctx, values, nil)
 	}
 	return nil
 }
@@ -1102,8 +1120,13 @@ func (rd *RowDeleter) DeleteRow(
 func (rd *RowDeleter) DeleteIndexRow(
 	ctx context.Context, b *client.Batch, idx *IndexDescriptor, values []tree.Datum, traceKV bool,
 ) error {
-	if err := rd.Fks.checkAll(ctx, values); err != nil {
-		return err
+	if rd.Fks.checker != nil {
+		if err := rd.Fks.addAllIdxChecks(ctx, values); err != nil {
+			return err
+		}
+		if err := rd.Fks.checker.runCheck(ctx, values, nil); err != nil {
+			return err
+		}
 	}
 	secondaryIndexEntry, err := EncodeSecondaryIndex(
 		rd.Helper.TableDesc, idx, rd.FetchColIDtoRowIndex, values)

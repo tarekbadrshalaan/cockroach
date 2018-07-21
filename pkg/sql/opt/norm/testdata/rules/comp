@@ -211,11 +211,13 @@ SELECT * FROM a WHERE (1, (2, 'foo')) = (k, (i, s))
 ----
 select
  ├── columns: k:1(int!null) i:2(int!null) f:3(float) s:4(string!null) j:5(jsonb)
+ ├── cardinality: [0 - 1]
  ├── key: ()
  ├── fd: ()-->(1-5)
  ├── scan a
  │    ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string) j:5(jsonb)
  │    ├── constraint: /1: [/1 - /1]
+ │    ├── cardinality: [0 - 1]
  │    ├── key: ()
  │    └── fd: ()-->(1-5)
  └── filters [type=bool, outer=(2,4), constraints=(/2: [/2 - /2]; /4: [/'foo' - /'foo']; tight), fd=()-->(2,4)]
@@ -225,12 +227,6 @@ select
 # --------------------------------------------------
 # FoldNullComparisonLeft, FoldNullComparisonRight
 # --------------------------------------------------
-
-# TODO(justin): re-add to the test below when we support JSON ops.
-# null::jsonb @> '"foo"' OR '"foo"' <@ null::jsonb OR
-# null::jsonb ? 'foo' OR '{}' ? null::string OR
-# null::jsonb ?| ARRAY['foo'] OR '{}' ?| null::string[] OR
-# null::jsonb ?& ARRAY['foo'] OR '{}' ?& null::string[]
 
 # Use null::type to circumvent type checker constant folding.
 opt
@@ -252,7 +248,11 @@ WHERE
     null::string ~ 'foo' OR 'foo' ~ null::string OR
     null::string !~ 'foo' OR 'foo' !~ null::string OR
     null::string ~* 'foo' OR 'foo' ~* null::string OR
-    null::string !~* 'foo' OR 'foo' !~* null::string
+    null::string !~* 'foo' OR 'foo' !~* null::string OR
+    null::jsonb @> '"foo"' OR '"foo"' <@ null::jsonb OR
+    null::jsonb ? 'foo' OR '{}' ? null::string OR
+    null::jsonb ?| ARRAY['foo'] OR '{}' ?| null::string[] OR
+    null::jsonb ?& ARRAY['foo'] OR '{}' ?& null::string[]
 ----
 scan a
  ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string) j:5(jsonb)
@@ -274,7 +274,7 @@ project
  ├── values
  │    ├── cardinality: [1 - 1]
  │    ├── key: ()
- │    └── tuple [type=tuple{}]
+ │    └── tuple [type=tuple]
  └── projections
       └── true [type=bool]
 
@@ -292,7 +292,7 @@ project
  ├── values
  │    ├── cardinality: [1 - 1]
  │    ├── key: ()
- │    └── tuple [type=tuple{}]
+ │    └── tuple [type=tuple]
  └── projections
       └── false [type=bool]
 
@@ -310,7 +310,7 @@ project
  ├── values
  │    ├── cardinality: [1 - 1]
  │    ├── key: ()
- │    └── tuple [type=tuple{}]
+ │    └── tuple [type=tuple]
  └── projections
       ├── false [type=bool]
       └── true [type=bool]
@@ -350,7 +350,7 @@ project
  ├── values
  │    ├── cardinality: [1 - 1]
  │    ├── key: ()
- │    └── tuple [type=tuple{}]
+ │    └── tuple [type=tuple]
  └── projections
       ├── true [type=bool]
       └── false [type=bool]

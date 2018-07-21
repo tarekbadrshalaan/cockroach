@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 )
 
 // CustomFuncs contains all the custom match and replace functions used by
@@ -37,6 +38,14 @@ import (
 type CustomFuncs struct {
 	xfunc.CustomFuncs
 	f *Factory
+}
+
+// MakeCustomFuncs returns a new CustomFuncs initialized with the given factory.
+func MakeCustomFuncs(f *Factory) CustomFuncs {
+	return CustomFuncs{
+		CustomFuncs: xfunc.MakeCustomFuncs(f.mem, f.evalCtx),
+		f:           f,
+	}
 }
 
 // ----------------------------------------------------------------------
@@ -119,6 +128,11 @@ func (c *CustomFuncs) HasColType(group memo.GroupID, colTyp memo.PrivateID) bool
 	return coltypes.ColTypeAsString(srcTyp) == coltypes.ColTypeAsString(dstTyp)
 }
 
+// IsString returns true if the given expression is of type String.
+func (c *CustomFuncs) IsString(group memo.GroupID) bool {
+	return c.LookupScalar(group).Type == types.String
+}
+
 // ColTypeToDatumType maps the given column type to a datum type.
 func (c *CustomFuncs) ColTypeToDatumType(colTyp memo.PrivateID) memo.PrivateID {
 	datumTyp := coltypes.CastTargetToDatumType(c.f.mem.LookupPrivate(colTyp).(coltypes.T))
@@ -128,6 +142,11 @@ func (c *CustomFuncs) ColTypeToDatumType(colTyp memo.PrivateID) memo.PrivateID {
 // BoolType returns the private ID of the boolean SQL type.
 func (c *CustomFuncs) BoolType() memo.PrivateID {
 	return c.f.InternType(types.Bool)
+}
+
+// AnyType returns the private ID of the wildcard Any type.
+func (c *CustomFuncs) AnyType() memo.PrivateID {
+	return c.f.InternType(types.Any)
 }
 
 // CanConstructBinary returns true if (op left right) has a valid binary op
@@ -210,6 +229,34 @@ func (c *CustomFuncs) HasOneOrMoreRows(group memo.GroupID) bool {
 // subquery within its subtree that has at least one outer column.
 func (c *CustomFuncs) HasCorrelatedSubquery(group memo.GroupID) bool {
 	return c.LookupScalar(group).HasCorrelatedSubquery
+}
+
+// ----------------------------------------------------------------------
+//
+// Ordering functions
+//   General custom match and replace functions related to orderings.
+//
+// ----------------------------------------------------------------------
+
+// HasColsInOrdering returns true if all columns that appear in an ordering are
+// output columns of the given group.
+func (c *CustomFuncs) HasColsInOrdering(group memo.GroupID, ordering memo.PrivateID) bool {
+	outCols := c.OutputCols(group)
+	return c.ExtractOrdering(ordering).CanProjectCols(outCols)
+}
+
+// PruneOrdering removes any columns referenced by an OrderingChoice that are
+// not output columns of the given group. Can only be called if
+// HasColsInOrdering is true.
+func (c *CustomFuncs) PruneOrdering(group memo.GroupID, ordering memo.PrivateID) memo.PrivateID {
+	outCols := c.OutputCols(group)
+	ord := c.ExtractOrdering(ordering)
+	if ord.SubsetOfCols(outCols) {
+		return ordering
+	}
+	ordCopy := ord.Copy()
+	ordCopy.ProjectCols(outCols)
+	return c.f.InternOrderingChoice(&ordCopy)
 }
 
 // ----------------------------------------------------------------------
@@ -302,20 +349,6 @@ func (c *CustomFuncs) ConcatFilters(left, right memo.GroupID) memo.GroupID {
 		lb.AddItem(right)
 	}
 	return c.f.ConstructFilters(lb.BuildList())
-}
-
-// HasNullRejectingFilter returns true if the filter causes some of the columns
-// of input to be non-null. If the input contains columns (x, z), filters such
-// as x < 5, x = y, and z IS NOT NULL all satisfy this property.
-func (c *CustomFuncs) HasNullRejectingFilter(filter, input memo.GroupID) bool {
-	filterConstraints := c.LookupLogical(filter).Scalar.Constraints
-	if filterConstraints == nil {
-		return false
-	}
-
-	notNullFilterCols := filterConstraints.ExtractNotNullCols(c.f.evalCtx)
-	inputCols := c.LookupLogical(input).Relational.OutputCols
-	return notNullFilterCols.Intersects(inputCols)
 }
 
 // ----------------------------------------------------------------------
@@ -948,4 +981,22 @@ func (c *CustomFuncs) NegateNumeric(input memo.GroupID) memo.GroupID {
 		panic(err)
 	}
 	return c.f.ConstructConst(c.f.InternDatum(r))
+}
+
+// IsJSONScalar returns if the JSON value is a number, string, true, false, or null.
+func (c *CustomFuncs) IsJSONScalar(value memo.GroupID) bool {
+	v := c.f.mem.LookupPrivate(c.f.mem.NormExpr(value).AsConst().Value()).(tree.Datum).(*tree.DJSON)
+	return v.JSON.Type() != json.ObjectJSONType && v.JSON.Type() != json.ArrayJSONType
+}
+
+// MakeSingleKeyJSONObject returns a JSON object with one entry, mapping key to value.
+func (c *CustomFuncs) MakeSingleKeyJSONObject(key, value memo.GroupID) memo.GroupID {
+	k := c.f.mem.LookupPrivate(c.f.mem.NormExpr(key).AsConst().Value()).(*tree.DString)
+	v := c.f.mem.LookupPrivate(c.f.mem.NormExpr(value).AsConst().Value()).(*tree.DJSON)
+
+	builder := json.NewObjectBuilder(1)
+	builder.Add(string(*k), v.JSON)
+	j := builder.Build()
+
+	return c.f.ConstructConst(c.f.InternDatum(&tree.DJSON{JSON: j}))
 }

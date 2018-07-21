@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kr/pretty"
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -35,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnosticspb"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -147,6 +149,12 @@ func TestReportUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	telemetry.Count("test.a")
+	c := telemetry.GetCounter("test.b")
+	telemetry.Inc(c)
+	telemetry.Inc(c)
+	telemetry.Inc(c)
+
 	for _, cmd := range []struct {
 		resource string
 		config   string
@@ -231,7 +239,9 @@ func TestReportUsage(t *testing.T) {
 		// should still not cause those strings to appear in reports.
 		for _, q := range []string{
 			`SELECT * FROM %[1]s.%[1]s WHERE %[1]s = 1 AND '%[1]s' = '%[1]s'`,
-			`INSERT INTO %[1]s.%[1]s VALUES (6), (7)`,
+			`INSERT INTO %[1]s.%[1]s VALUES (6), (7), (8)`,
+			`INSERT INTO %[1]s.%[1]s SELECT unnest(ARRAY[9, 10, 11, 12])`,
+			`SELECT (1, 20, 30, 40) = (SELECT %[1]s, 1, 2, 3 FROM %[1]s.%[1]s LIMIT 1)`,
 			`SET application_name = '%[1]s'`,
 			`SELECT %[1]s FROM %[1]s.%[1]s WHERE %[1]s = 1 AND lower('%[1]s') = lower('%[1]s')`,
 			`UPDATE %[1]s.%[1]s SET %[1]s = %[1]s + 1`,
@@ -365,6 +375,20 @@ func TestReportUsage(t *testing.T) {
 		}
 	}
 
+	if expected, actual := 2, len(r.last.FeatureUsage); expected != actual {
+		t.Fatalf("expected %d feature usage counts, got %d: %v", expected, actual, r.last.FeatureUsage)
+	}
+	for key, expected := range map[string]int32{
+		"test.a": 1,
+		"test.b": 3,
+	} {
+		if got, ok := r.last.FeatureUsage[key]; !ok {
+			t.Fatalf("expected report of feature %q", key)
+		} else if got != expected {
+			t.Fatalf("expected reported value of feature %q to be %d not %d", key, expected, got)
+		}
+	}
+
 	if expected, actual := 5, len(r.last.ErrorCounts); expected != actual {
 		t.Fatalf("expected %d error codes counts in report, got %d (%v)", expected, actual, r.last.ErrorCounts)
 	}
@@ -420,7 +444,7 @@ func TestReportUsage(t *testing.T) {
 		"diagnostics.reporting.send_crash_reports": "false",
 		"server.time_until_store_dead":             "1m30s",
 		"trace.debug.enable":                       "false",
-		"version":                                  "2.0-7",
+		"version":                                  "2.0-9",
 		"cluster.secret":                           "<redacted>",
 	} {
 		if got, ok := r.last.AlteredSettings[key]; !ok {
@@ -507,14 +531,20 @@ func TestReportUsage(t *testing.T) {
 	}
 	sort.Strings(foundKeys)
 	expectedKeys := []string{
+		`[false,false] ALTER DATABASE _ EXPERIMENTAL CONFIGURE ZONE _`,
+		`[false,false] ALTER TABLE _ EXPERIMENTAL CONFIGURE ZONE _`,
 		`[false,false] CREATE DATABASE _`,
 		`[false,false] CREATE TABLE _ (_ INT, CONSTRAINT _ CHECK (_ > _))`,
-		`[false,false] INSERT INTO _ VALUES (_)`,
-		`[false,false] INSERT INTO _ VALUES (length($1::STRING))`,
+		`[false,false] INSERT INTO _ SELECT unnest(ARRAY[_, _, __more2__])`,
+		`[false,false] INSERT INTO _ VALUES (_), (__more2__)`,
+		`[false,false] INSERT INTO _ VALUES (length($1::STRING)), (__more1__)`,
 		`[false,false] INSERT INTO _(_, _) VALUES (_, _)`,
+		`[false,false] SELECT (_, _, __more2__) = (SELECT _, _, _, _ FROM _ LIMIT _)`,
 		`[false,false] SET CLUSTER SETTING "cluster.organization" = _`,
 		`[false,false] SET CLUSTER SETTING "diagnostics.reporting.send_crash_reports" = _`,
 		`[false,false] SET CLUSTER SETTING "server.time_until_store_dead" = _`,
+		`[false,false] SET application_name = DEFAULT`,
+		`[false,false] SET application_name = _`,
 		`[false,false] UPDATE _ SET _ = _ + _`,
 		`[false,true] CREATE TABLE _ (_ INT PRIMARY KEY, _ INT, INDEX (_) INTERLEAVE IN PARENT _ (_))`,
 		`[false,true] SELECT _ / $1`,
@@ -524,6 +554,7 @@ func TestReportUsage(t *testing.T) {
 		`[true,false] SELECT * FROM _ WHERE (_ = length($1::STRING)) OR (_ = $2)`,
 		`[true,false] SELECT _ FROM _ WHERE (_ = _) AND (lower(_) = lower(_))`,
 	}
+	t.Logf("expected:\n%s\ngot:\n%s", pretty.Sprint(expectedKeys), pretty.Sprint(foundKeys))
 	for i, found := range foundKeys {
 		if i >= len(expectedKeys) {
 			t.Fatalf("extraneous stat entry: %q", found)
@@ -547,12 +578,16 @@ func TestReportUsage(t *testing.T) {
 
 	for appName, expectedStatements := range map[string][]string{
 		"": {
+			`ALTER DATABASE _ EXPERIMENTAL CONFIGURE ZONE _`,
+			`ALTER TABLE _ EXPERIMENTAL CONFIGURE ZONE _`,
 			`CREATE DATABASE _`,
 			`CREATE TABLE _ (_ INT, CONSTRAINT _ CHECK (_ > _))`,
 			`CREATE TABLE _ (_ INT PRIMARY KEY, _ INT, INDEX (_) INTERLEAVE IN PARENT _ (_))`,
-			`INSERT INTO _ VALUES (length($1::STRING))`,
-			`INSERT INTO _ VALUES (_)`,
+			`INSERT INTO _ VALUES (length($1::STRING)), (__more1__)`,
+			`INSERT INTO _ VALUES (_), (__more2__)`,
+			`INSERT INTO _ SELECT unnest(ARRAY[_, _, __more2__])`,
 			`INSERT INTO _(_, _) VALUES (_, _)`,
+			`SELECT (_, _, __more2__) = (SELECT _, _, _, _ FROM _ LIMIT _)`,
 			`SELECT * FROM _ WHERE (_ = length($1::STRING)) OR (_ = $2)`,
 			`SELECT * FROM _ WHERE (_ = _) AND (_ = _)`,
 			`SELECT _ / $1`,
@@ -560,11 +595,13 @@ func TestReportUsage(t *testing.T) {
 			`SELECT crdb_internal.force_error(_, $1)`,
 			`SET CLUSTER SETTING "server.time_until_store_dead" = _`,
 			`SET CLUSTER SETTING "diagnostics.reporting.send_crash_reports" = _`,
+			`SET application_name = _`,
 		},
 		elemName: {
 			`SELECT _ FROM _ WHERE (_ = _) AND (lower(_) = lower(_))`,
 			`UPDATE _ SET _ = _ + _`,
 			`SET CLUSTER SETTING "cluster.organization" = _`,
+			`SET application_name = DEFAULT`,
 		},
 	} {
 		hashedAppName := sql.HashForReporting(clusterSecret, appName)
@@ -586,7 +623,7 @@ func TestReportUsage(t *testing.T) {
 			}
 			for _, expected := range expectedStatements {
 				if _, ok := keys[expected]; !ok {
-					t.Fatalf("expected %q in app %s: %+v", expected, appName, keys)
+					t.Fatalf("expected %q in app %s: %s", expected, pretty.Sprint(appName), pretty.Sprint(keys))
 				}
 			}
 		}

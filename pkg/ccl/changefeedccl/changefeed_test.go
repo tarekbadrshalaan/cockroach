@@ -14,6 +14,7 @@ import (
 	gojson "encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -273,8 +274,8 @@ func TestChangefeedErrors(t *testing.T) {
 
 	if _, err := sqlDB.DB.Exec(
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope`,
-	); !testutils.IsError(err, `no test producer: nope`) {
-		t.Fatalf(`expected 'no test producer: nope' error got: %+v`, err)
+	); !testutils.IsError(err, `client has run out of available brokers`) {
+		t.Fatalf(`expected 'client has run out of available brokers' error got: %+v`, err)
 	}
 	if _, err := sqlDB.DB.Exec(
 		`CREATE CHANGEFEED FOR foo INTO ''`,
@@ -309,6 +310,10 @@ func assertPayloads(t *testing.T, rows *gosql.Rows, expected []string) {
 		t.Fatalf(`%+v`, err)
 	}
 
+	// The tests that use this aren't concerned with order, just that these are
+	// the next len(expected) messages.
+	sort.Strings(expected)
+	sort.Strings(actual)
 	if !reflect.DeepEqual(expected, actual) {
 		t.Fatalf("expected\n  %s\ngot\n  %s",
 			strings.Join(expected, "\n  "), strings.Join(actual, "\n  "))

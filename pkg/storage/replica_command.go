@@ -56,10 +56,6 @@ func evaluateCommand(
 	reply roachpb.Response,
 ) (result.Result, *roachpb.Error) {
 
-	if _, ok := args.(*roachpb.NoopRequest); ok {
-		return result.Result{}, nil
-	}
-
 	// If a unittest filter was installed, check for an injected error; otherwise, continue.
 	if filter := rec.EvalKnobs().TestingEvalFilter; filter != nil {
 		filterArgs := storagebase.FilterArgs{
@@ -96,16 +92,7 @@ func evaluateCommand(
 	}
 
 	if h.ReturnRangeInfo {
-		header := reply.Header()
-		lease, _ := rec.GetLease()
-		desc := rec.Desc()
-		header.RangeInfos = []roachpb.RangeInfo{
-			{
-				Desc:  *desc,
-				Lease: lease,
-			},
-		}
-		reply.SetHeader(header)
+		returnRangeInfo(reply, rec)
 	}
 
 	// TODO(peter): We'd like to assert that the hlc clock is always updated
@@ -133,6 +120,19 @@ func evaluateCommand(
 	}
 
 	return pd, pErr
+}
+
+func returnRangeInfo(reply roachpb.Response, rec batcheval.EvalContext) {
+	header := reply.Header()
+	lease, _ := rec.GetLease()
+	desc := rec.Desc()
+	header.RangeInfos = []roachpb.RangeInfo{
+		{
+			Desc:  *desc,
+			Lease: lease,
+		},
+	}
+	reply.SetHeader(header)
 }
 
 // AdminSplit divides the range into into two ranges using args.SplitKey.
@@ -471,15 +471,22 @@ func (r *Replica) AdminMerge(
 		// a consistent view of the data from the right-hand range. If the merge
 		// commits, we'll write this data to the left-hand range in the merge
 		// trigger.
-		br, pErr := client.SendWrapped(ctx, r.store.DB().NonTransactionalSender(),
-			&roachpb.GetSnapshotForMergeRequest{
-				RequestHeader: roachpb.RequestHeader{Key: rightDesc.StartKey.AsRawKey()},
-				LeftRange:     *origLeftDesc,
-			})
-		if pErr != nil {
-			return pErr.GoError()
+		//
+		// We make sure to send this request through the txn so that we can stall
+		// its write pipeline and prevent any reads to the right-hand range when
+		// the EndTransactionRequest is issued.
+		// TODO(nvanbenschoten): this is subtle and it's not clear that its the
+		// best way to achieve this goal. Reconsider.
+		b = txn.NewBatch()
+		b.AddRawRequest(&roachpb.GetSnapshotForMergeRequest{
+			RequestHeader: roachpb.RequestHeader{Key: rightDesc.StartKey.AsRawKey()},
+			LeftRange:     *origLeftDesc,
+		})
+		if err := txn.Run(ctx, b); err != nil {
+			return err
 		}
-		rhsSnapshotRes := br.(*roachpb.GetSnapshotForMergeResponse)
+		br := b.RawResponse()
+		rhsSnapshotRes := br.Responses[0].GetInner().(*roachpb.GetSnapshotForMergeResponse)
 
 		// Successful subsume, so we're guaranteed that the right-hand range will
 		// not serve another request unless this transaction aborts. End the

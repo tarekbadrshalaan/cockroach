@@ -214,10 +214,8 @@ SELECT a, b, b FROM t ORDER BY c
 sort
  ├── columns: a:1(int!null) b:2(int) b:2(int)
  ├── ordering: +3
- └── project
-      ├── columns: a:1(int!null) b:2(int) c:3(bool)
-      └── scan t
-           └── columns: a:1(int!null) b:2(int) c:3(bool)
+ └── scan t
+      └── columns: a:1(int!null) b:2(int) c:3(bool)
 
 build
 SELECT * FROM t ORDER BY (b, t.*)
@@ -402,37 +400,75 @@ error (42P01): no data source matches prefix: a
 build
 SELECT generate_series FROM generate_series(1, 100) ORDER BY ARRAY[generate_series]
 ----
-error (0A000): not yet implemented: table expr: *tree.RowsFromExpr
+error (0A000): can't order by column type int[]
 
 build
 SELECT ARRAY[generate_series] FROM generate_series(1, 100) ORDER BY ARRAY[generate_series]
 ----
-error (0A000): not yet implemented: table expr: *tree.RowsFromExpr
+error (0A000): can't order by column type int[]
 
 build
 SELECT ARRAY[generate_series] FROM generate_series(1, 100) ORDER BY 1
 ----
-error (0A000): not yet implemented: table expr: *tree.RowsFromExpr
+error (0A000): can't order by column type int[]
 
 build
 SELECT ARRAY[generate_series] AS a FROM generate_series(1, 100) ORDER BY a
 ----
-error (0A000): not yet implemented: table expr: *tree.RowsFromExpr
+error (0A000): can't order by column type int[]
 
 build
 SELECT generate_series, ARRAY[generate_series] FROM generate_series(1, 1) ORDER BY 1
 ----
-error (0A000): not yet implemented: table expr: *tree.RowsFromExpr
+sort
+ ├── columns: generate_series:1(int) array:2(int[])
+ ├── ordering: +1
+ └── project
+      ├── columns: array:2(int[]) generate_series:1(int)
+      ├── zip
+      │    ├── columns: generate_series:1(int)
+      │    └── function: generate_series [type=tuple{int AS generate_series}]
+      │         ├── const: 1 [type=int]
+      │         └── const: 1 [type=int]
+      └── projections
+           └── array: [type=int[]]
+                └── variable: generate_series [type=int]
 
 build
 SELECT generate_series, ARRAY[generate_series] FROM generate_series(1, 1) ORDER BY generate_series
 ----
-error (0A000): not yet implemented: table expr: *tree.RowsFromExpr
+sort
+ ├── columns: generate_series:1(int) array:2(int[])
+ ├── ordering: +1
+ └── project
+      ├── columns: array:2(int[]) generate_series:1(int)
+      ├── zip
+      │    ├── columns: generate_series:1(int)
+      │    └── function: generate_series [type=tuple{int AS generate_series}]
+      │         ├── const: 1 [type=int]
+      │         └── const: 1 [type=int]
+      └── projections
+           └── array: [type=int[]]
+                └── variable: generate_series [type=int]
 
 build
 SELECT generate_series, ARRAY[generate_series] FROM generate_series(1, 1) ORDER BY -generate_series
 ----
-error (0A000): not yet implemented: table expr: *tree.RowsFromExpr
+sort
+ ├── columns: generate_series:1(int) array:2(int[])
+ ├── ordering: +3
+ └── project
+      ├── columns: array:2(int[]) column3:3(int) generate_series:1(int)
+      ├── zip
+      │    ├── columns: generate_series:1(int)
+      │    └── function: generate_series [type=tuple{int AS generate_series}]
+      │         ├── const: 1 [type=int]
+      │         └── const: 1 [type=int]
+      └── projections
+           ├── array: [type=int[]]
+           │    └── variable: generate_series [type=int]
+           └── unary-minus [type=int]
+                └── variable: generate_series [type=int]
 
 
 # Sort should be skipped if the ORDER BY clause is constant.
@@ -711,15 +747,17 @@ sort
  ├── columns: b:2(int!null) c:3(int!null)
  ├── ordering: +2,+3
  └── project
-      ├── columns: a:1(int!null) b:2(int!null) c:3(int!null)
-      └── select
-           ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
-           ├── scan abc
-           │    └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
-           └── filters [type=bool]
-                └── eq [type=bool]
-                     ├── variable: abc.a [type=int]
-                     └── const: 1 [type=int]
+      ├── columns: b:2(int!null) c:3(int!null)
+      └── project
+           ├── columns: a:1(int!null) b:2(int!null) c:3(int!null)
+           └── select
+                ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+                ├── scan abc
+                │    └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+                └── filters [type=bool]
+                     └── eq [type=bool]
+                          ├── variable: abc.a [type=int]
+                          └── const: 1 [type=int]
 
 build
 SELECT a FROM abc ORDER BY INDEX abc@bc
@@ -860,6 +898,11 @@ limit
  │         ├── columns: block_id:1(int!null) writer_id:2(string!null) block_num:3(int!null) raw_bytes:4(bytes)
  │         └── ordering: +1,+2,+3
  └── const: 1 [type=int]
+
+# Drop previous table with same name, but different schema.
+exec-ddl
+DROP TABLE abcd
+----
 
 exec-ddl
 CREATE TABLE abcd (

@@ -15,6 +15,7 @@
 package xform
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -70,30 +71,37 @@ const (
 // expression's cost must always be >= the total costs of its children, so that
 // branch-and-bound pruning will work properly.
 func (c *coster) ComputeCost(candidate *memo.BestExpr, logical *props.Logical) memo.Cost {
+	var cost memo.Cost
 	switch candidate.Operator() {
 	case opt.SortOp:
-		return c.computeSortCost(candidate, logical)
+		cost = c.computeSortCost(candidate, logical)
 
 	case opt.ScanOp:
-		return c.computeScanCost(candidate, logical)
+		cost = c.computeScanCost(candidate, logical)
+
+	case opt.VirtualScanOp:
+		cost = c.computeVirtualScanCost(candidate, logical)
 
 	case opt.SelectOp:
-		return c.computeSelectCost(candidate, logical)
+		cost = c.computeSelectCost(candidate, logical)
 
 	case opt.ValuesOp:
-		return c.computeValuesCost(candidate, logical)
+		cost = c.computeValuesCost(candidate, logical)
 
 	case opt.InnerJoinOp, opt.LeftJoinOp, opt.RightJoinOp, opt.FullJoinOp,
 		opt.SemiJoinOp, opt.AntiJoinOp, opt.InnerJoinApplyOp, opt.LeftJoinApplyOp,
 		opt.RightJoinApplyOp, opt.FullJoinApplyOp, opt.SemiJoinApplyOp, opt.AntiJoinApplyOp:
 		// All join ops use hash join by default.
-		return c.computeHashJoinCost(candidate, logical)
+		cost = c.computeHashJoinCost(candidate, logical)
 
 	case opt.MergeJoinOp:
-		return c.computeMergeJoinCost(candidate, logical)
+		cost = c.computeMergeJoinCost(candidate, logical)
 
 	case opt.IndexJoinOp:
-		return c.computeIndexJoinCost(candidate, logical)
+		cost = c.computeIndexJoinCost(candidate, logical)
+
+	case opt.LookupJoinOp:
+		cost = c.computeLookupJoinCost(candidate, logical)
 
 	// TODO(rytaft): Add linear cost functions for GROUP BY, set ops, etc.
 
@@ -106,8 +114,15 @@ func (c *coster) ComputeCost(candidate *memo.BestExpr, logical *props.Logical) m
 
 	default:
 		// By default, cost of parent is sum of child costs.
-		return c.computeChildrenCost(candidate)
+		cost = c.computeChildrenCost(candidate)
 	}
+	if !cost.Less(memo.MaxCost) {
+		// Optsteps uses MaxCost to suppress expressions in the memo. When an
+		// expression with MaxCost is added to the memo, it can lead to an obscure
+		// crash with an unknown operation. We'd rather detect this early.
+		panic(fmt.Sprintf("operator %s with MaxCost added to the memo", candidate.Operator()))
+	}
+	return cost
 }
 
 func (c *coster) computeSortCost(candidate *memo.BestExpr, logical *props.Logical) memo.Cost {
@@ -129,11 +144,20 @@ func (c *coster) computeScanCost(candidate *memo.BestExpr, logical *props.Logica
 	// each column. In lieu of that, use the number of columns.
 	def := candidate.Private(c.mem).(*memo.ScanOpDef)
 	rowCount := memo.Cost(logical.Relational.Stats.RowCount)
-	reverseMultiplier := memo.Cost(1)
+	perRowCost := c.rowScanCost(def.Table, def.Index, def.Cols.Len())
 	if def.Reverse {
-		reverseMultiplier++
+		perRowCost *= 2
 	}
-	return rowCount * (seqIOCostFactor + reverseMultiplier*c.rowScanCost(def.Table, def.Index, def.Cols.Len()))
+	return rowCount * (seqIOCostFactor + perRowCost)
+}
+
+func (c *coster) computeVirtualScanCost(
+	candidate *memo.BestExpr, logical *props.Logical,
+) memo.Cost {
+	// Virtual tables are generated on-the-fly according to system metadata that
+	// is assumed to be in memory.
+	rowCount := memo.Cost(logical.Relational.Stats.RowCount)
+	return rowCount * cpuCostFactor
 }
 
 // rowScanCost is the CPU cost to scan one row, which depends on the number of
@@ -166,7 +190,7 @@ func (c *coster) computeHashJoinCost(candidate *memo.BestExpr, logical *props.Lo
 
 	// A hash join must process every row from both tables once.
 	//
-	// We add some factors to account for the hashtable build and lookups.  The
+	// We add some factors to account for the hashtable build and lookups. The
 	// right side is the one stored in the hashtable, so we use a larger factor
 	// for that side. This ensures that a join with the smaller right side is
 	// preferred to the symmetric join.
@@ -197,16 +221,38 @@ func (c *coster) computeMergeJoinCost(candidate *memo.BestExpr, logical *props.L
 }
 
 func (c *coster) computeIndexJoinCost(candidate *memo.BestExpr, logical *props.Logical) memo.Cost {
-	leftCost := c.mem.BestExprCost(candidate.Child(0))
 	leftRowCount := c.mem.BestExprLogical(candidate.Child(0)).Relational.Stats.RowCount
 	def := candidate.Private(c.mem).(*memo.IndexJoinDef)
+
+	cost := c.mem.BestExprCost(candidate.Child(0))
 
 	// The rows in the (left) input are used to probe into the (right) table.
 	// Since the matching rows in the table may not all be in the same range, this
 	// counts as random I/O.
 	perRowCost := cpuCostFactor + randIOCostFactor +
 		c.rowScanCost(def.Table, opt.PrimaryIndex, def.Cols.Len())
-	return leftCost + memo.Cost(leftRowCount)*perRowCost
+	cost += memo.Cost(leftRowCount) * perRowCost
+	return cost
+}
+
+func (c *coster) computeLookupJoinCost(candidate *memo.BestExpr, logical *props.Logical) memo.Cost {
+	leftRowCount := c.mem.BestExprLogical(candidate.Child(0)).Relational.Stats.RowCount
+	def := candidate.Private(c.mem).(*memo.LookupJoinDef)
+
+	cost := c.mem.BestExprCost(candidate.Child(0))
+
+	// The rows in the (left) input are used to probe into the (right) table.
+	// Since the matching rows in the table may not all be in the same range, this
+	// counts as random I/O.
+	perLookupCost := memo.Cost(randIOCostFactor)
+	cost += memo.Cost(leftRowCount) * perLookupCost
+
+	// Each lookup might retrieve many rows; add the IO cost of retrieving the
+	// rows (relevant when we expect many resulting rows per lookup) and the CPU
+	// cost of emitting the rows.
+	perRowCost := seqIOCostFactor + c.rowScanCost(def.Table, def.Index, def.LookupCols.Len())
+	cost += memo.Cost(logical.Relational.Stats.RowCount) * perRowCost
+	return cost
 }
 
 func (c *coster) computeChildrenCost(candidate *memo.BestExpr) memo.Cost {

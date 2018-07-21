@@ -188,7 +188,7 @@ func (ex *connExecutor) prepare(
 		p.extendedEvalCtx.ActiveMemAcc = &constantMemAcc
 		defer constantMemAcc.Close(ctx)
 
-		protoTS, err := isAsOf(stmt.AST, p.EvalContext(), ex.server.cfg.Clock.Now() /* max */)
+		protoTS, err := p.isAsOf(stmt.AST, ex.server.cfg.Clock.Now() /* max */)
 		if err != nil {
 			return err
 		}
@@ -212,8 +212,11 @@ func (ex *connExecutor) prepare(
 		if optimizerPlanned, err := p.optionallyUseOptimizer(ctx, ex.sessionData, stmt); err != nil {
 			return err
 		} else if !optimizerPlanned {
+			isCorrelated := p.curPlan.isCorrelated
+			log.VEventf(ctx, 1, "query is correlated: %v", isCorrelated)
 			// Fallback if the optimizer was not enabled or used.
 			if err := p.prepare(ctx, stmt.AST); err != nil {
+				enhanceErrWithCorrelation(err, isCorrelated)
 				return err
 			}
 		}

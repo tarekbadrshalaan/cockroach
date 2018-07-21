@@ -50,6 +50,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
 	"github.com/cockroachdb/cockroach/pkg/server/heapprofiler"
@@ -109,7 +110,7 @@ var (
 
 	forwardClockJumpCheckEnabled = settings.RegisterBoolSetting(
 		"server.clock.forward_jump_check_enabled",
-		"If enabled, forward clock jumps > max_offset/2 will cause a panic.",
+		"if enabled, forward clock jumps > max_offset/2 will cause a panic.",
 		false,
 	)
 
@@ -136,6 +137,7 @@ type Server struct {
 	rpcContext         *rpc.Context
 	grpc               *grpc.Server
 	gossip             *gossip.Gossip
+	nodeDialer         *nodedialer.Dialer
 	nodeLiveness       *storage.NodeLiveness
 	storePool          *storage.StorePool
 	tcsFactory         *kv.TxnCoordSenderFactory
@@ -239,6 +241,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		s.stopper,
 		s.registry,
 	)
+	s.nodeDialer = nodedialer.New(s.rpcContext, gossip.AddressResolver(s.gossip))
 
 	// A custom RetryOptions is created which uses stopper.ShouldQuiesce() as
 	// the Closer. This prevents infinite retry loops from occurring during
@@ -314,7 +317,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	)
 
 	s.raftTransport = storage.NewRaftTransport(
-		s.cfg.AmbientCtx, st, storage.GossipAddressResolver(s.gossip), s.grpc, s.rpcContext,
+		s.cfg.AmbientCtx, st, s.nodeDialer, s.grpc, s.stopper,
 	)
 
 	// Set up internal memory metrics for use by internal SQL executors.
@@ -407,8 +410,10 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		Gossip:                  s.gossip,
 		NodeLiveness:            s.nodeLiveness,
 		Transport:               s.raftTransport,
+		NodeDialer:              s.nodeDialer,
 		RPCContext:              s.rpcContext,
 		ScanInterval:            s.cfg.ScanInterval,
+		ScanMinIdleTime:         s.cfg.ScanMinIdleTime,
 		ScanMaxIdleTime:         s.cfg.ScanMaxIdleTime,
 		TimestampCachePageSize:  s.cfg.TimestampCachePageSize,
 		HistogramWindowInterval: s.cfg.HistogramWindowInterval(),

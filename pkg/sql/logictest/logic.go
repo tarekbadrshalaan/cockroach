@@ -48,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -358,7 +359,8 @@ var (
 			"beware! some tests INTEND to use non-formatted SQL queries (e.g. case sensitivity). "+
 			"do not bluntly apply!",
 	)
-	sqlfmtLen = flag.Int("line-length", tree.DefaultPrettyWidth, "target line length when using -rewrite-sql")
+	sqlfmtLen = flag.Int("line-length", tree.DefaultPrettyCfg().LineWidth,
+		"target line length when using -rewrite-sql")
 )
 
 type testClusterConfig struct {
@@ -526,13 +528,15 @@ func (ls *logicStatement) readSQL(
 					return "", errors.Wrapf(err, "%s: error while parsing SQL for reformat:\n%s", ls.pos, ls.sql)
 				}
 				var newSyntax bytes.Buffer
+				pcfg := tree.DefaultPrettyCfg()
+				pcfg.LineWidth = *sqlfmtLen
+				pcfg.Simplify = false
+				pcfg.UseTabs = false
 				for i, s := range stmtList {
 					if i > 0 {
 						fmt.Fprintln(&newSyntax, ";")
 					}
-					fmt.Fprint(&newSyntax,
-						tree.PrettyWithOpts(s,
-							*sqlfmtLen, false /* useTabs */, 4 /* tab width */, false /* simplify */))
+					fmt.Fprint(&newSyntax, pcfg.Pretty(s))
 				}
 				return newSyntax.String(), nil
 			}(ls.sql)
@@ -948,7 +952,7 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 	}
 
 	distSQLKnobs := &distsqlrun.TestingKnobs{
-		MetadataTestLevel: distsqlrun.Off, OverrideStallTime: true,
+		MetadataTestLevel: distsqlrun.Off, DeterministicStats: true,
 	}
 	if cfg.distSQLUseDisk {
 		distSQLKnobs.MemoryLimitBytes = 1
@@ -1597,14 +1601,20 @@ func (t *logicTest) verifyError(
 		return cont, err
 	}
 	if !testutils.IsError(err, expectErr) {
-		newErr := errors.Errorf("%s: %s\nexpected %q, but found %v", pos, sql, expectErr, err)
-		if err != nil && strings.Contains(err.Error(), expectErr) {
+		if err == nil {
+			newErr := errors.Errorf("%s: %s\nexpected %q, but no error occurred", pos, sql, expectErr)
+			return false, newErr
+		}
+
+		errString := pgerror.FullError(err)
+		newErr := errors.Errorf("%s: %s\nexpected %q, but found %q", pos, sql, expectErr, errString)
+		if err != nil && strings.Contains(errString, expectErr) {
 			if t.subtestT != nil {
 				t.subtestT.Logf("The output string contained the input regexp. Perhaps you meant to write:\n"+
-					"query error %s", regexp.QuoteMeta(err.Error()))
+					"query error %s", regexp.QuoteMeta(errString))
 			} else {
 				t.t.Logf("The output string contained the input regexp. Perhaps you meant to write:\n"+
-					"query error %s", regexp.QuoteMeta(err.Error()))
+					"query error %s", regexp.QuoteMeta(errString))
 			}
 		}
 		return (err == nil) == (expectErr == ""), newErr

@@ -33,13 +33,14 @@ import (
 )
 
 type execFactory struct {
+	ctx     context.Context
 	planner *planner
 }
 
 var _ exec.Factory = &execFactory{}
 
-func makeExecFactory(p *planner) execFactory {
-	return execFactory{planner: p}
+func makeExecFactory(ctx context.Context, p *planner) execFactory {
+	return execFactory{ctx: ctx, planner: p}
 }
 
 // ConstructValues is part of the exec.Factory interface.
@@ -99,6 +100,17 @@ func (ef *execFactory) ConstructScan(
 	scan.props.ordering = reqOrder
 	scan.createdByOpt = true
 	return scan, nil
+}
+
+// ConstructVirtualScan is part of the exec.Factory interface.
+func (ef *execFactory) ConstructVirtualScan(table opt.Table) (exec.Node, error) {
+	tn := table.TabName()
+	virtual, err := ef.planner.getVirtualTabler().getVirtualTableEntry(tn)
+	if err != nil {
+		return nil, err
+	}
+	_, constructor := virtual.getPlanInfo()
+	return constructor(ef.ctx, ef.planner, tn.Catalog())
 }
 
 func asDataSource(n exec.Node) planDataSource {
@@ -289,15 +301,29 @@ func (ef *execFactory) ConstructMergeJoin(
 	return node, nil
 }
 
+// ConstructScalarGroupBy is part of the exec.Factory interface.
+func (ef *execFactory) ConstructScalarGroupBy(
+	input exec.Node, aggregations []exec.AggInfo,
+) (exec.Node, error) {
+	return ef.constructGroupBy(input, nil /* groupCols */, aggregations, true /* isScalar */)
+}
+
 // ConstructGroupBy is part of the exec.Factory interface.
 func (ef *execFactory) ConstructGroupBy(
 	input exec.Node, groupCols []exec.ColumnOrdinal, aggregations []exec.AggInfo,
+) (exec.Node, error) {
+	return ef.constructGroupBy(input, groupCols, aggregations, false /* isScalar */)
+}
+
+func (ef *execFactory) constructGroupBy(
+	input exec.Node, groupCols []exec.ColumnOrdinal, aggregations []exec.AggInfo, isScalar bool,
 ) (exec.Node, error) {
 	n := &groupNode{
 		plan:      input.(planNode),
 		funcs:     make([]*aggregateFuncHolder, 0, len(groupCols)+len(aggregations)),
 		columns:   make(sqlbase.ResultColumns, 0, len(groupCols)+len(aggregations)),
 		groupCols: make([]int, len(groupCols)),
+		isScalar:  isScalar,
 	}
 	for i, col := range groupCols {
 		n.groupCols[i] = int(col)
@@ -352,10 +378,6 @@ func (ef *execFactory) ConstructGroupBy(
 			Typ:  agg.ResultType,
 		})
 	}
-
-	// Queries like `SELECT MAX(n) FROM t` expect a row of NULLs if nothing was aggregated.
-	n.run.addNullBucketIfEmpty = len(groupCols) == 0
-	n.run.buckets = make(map[string]struct{})
 	return n, nil
 }
 
@@ -459,6 +481,60 @@ func (ef *execFactory) ConstructIndexJoin(
 	}, nil
 }
 
+// ConstructLookupJoin is part of the exec.Factory interface.
+func (ef *execFactory) ConstructLookupJoin(
+	joinType sqlbase.JoinType,
+	input exec.Node,
+	table opt.Table,
+	index opt.Index,
+	keyCols []exec.ColumnOrdinal,
+	lookupCols exec.ColumnOrdinalSet,
+	onCond tree.TypedExpr,
+	reqOrder sqlbase.ColumnOrdering,
+) (exec.Node, error) {
+	tabDesc := table.(*optTable).desc
+	indexDesc := index.(*optIndex).desc
+	colCfg := scanColumnsConfig{
+		wantedColumns: make([]tree.ColumnID, 0, lookupCols.Len()),
+	}
+
+	for c, ok := lookupCols.Next(0); ok; c, ok = lookupCols.Next(c + 1) {
+		colCfg.wantedColumns = append(colCfg.wantedColumns, tree.ColumnID(tabDesc.Columns[c].ID))
+	}
+
+	tableScan := ef.planner.Scan()
+
+	if err := tableScan.initTable(context.TODO(), ef.planner, tabDesc, nil, colCfg); err != nil {
+		return nil, err
+	}
+
+	tableScan.index = indexDesc
+	tableScan.run.isSecondaryIndex = (indexDesc != &tabDesc.PrimaryIndex)
+	tableScan.disableBatchLimit()
+
+	n := &lookupJoinNode{
+		input:    input.(planNode),
+		table:    tableScan,
+		joinType: joinType,
+		props: physicalProps{
+			ordering: reqOrder,
+		},
+	}
+	if onCond != nil && onCond != tree.DBoolTrue {
+		n.onCond = onCond
+	}
+	n.keyCols = make([]int, len(keyCols))
+	for i, c := range keyCols {
+		n.keyCols[i] = int(c)
+	}
+	inputCols := planColumns(input.(planNode))
+	scanCols := planColumns(tableScan)
+	n.columns = make(sqlbase.ResultColumns, 0, len(inputCols)+len(scanCols))
+	n.columns = append(n.columns, inputCols...)
+	n.columns = append(n.columns, scanCols...)
+	return n, nil
+}
+
 // ConstructLimit is part of the exec.Factory interface.
 func (ef *execFactory) ConstructLimit(
 	input exec.Node, limit, offset tree.TypedExpr,
@@ -477,6 +553,41 @@ func (ef *execFactory) ConstructLimit(
 		countExpr:  limit,
 		offsetExpr: offset,
 	}, nil
+}
+
+// ConstructProjectSet is part of the exec.Factory interface.
+func (ef *execFactory) ConstructProjectSet(
+	n exec.Node, exprs tree.TypedExprs, cols sqlbase.ResultColumns,
+) (exec.Node, error) {
+	src := asDataSource(n)
+	p := &projectSetNode{
+		source:          src.plan,
+		sourceInfo:      src.info,
+		columns:         cols,
+		numColsInSource: len(src.info.SourceColumns),
+		exprs:           exprs,
+		funcs:           make([]*tree.FuncExpr, len(exprs)),
+		numColsPerGen:   make([]int, len(exprs)),
+		run: projectSetRun{
+			gens:      make([]tree.ValueGenerator, len(exprs)),
+			done:      make([]bool, len(exprs)),
+			rowBuffer: make(tree.Datums, len(cols)),
+		},
+	}
+
+	for i, expr := range exprs {
+		if tFunc, ok := expr.(*tree.FuncExpr); ok && tFunc.IsGeneratorApplication() {
+			// Set-generating functions: generate_series() etc.
+			tType := expr.ResolvedType().(types.TTuple)
+			p.funcs[i] = tFunc
+			p.numColsPerGen[i] = len(tType.Types)
+		} else {
+			// A simple non-generator expression.
+			p.numColsPerGen[i] = 1
+		}
+	}
+
+	return p, nil
 }
 
 // ConstructPlan is part of the exec.Factory interface.

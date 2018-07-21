@@ -369,10 +369,12 @@ func init() {
 
 	// sqlfmt command.
 	VarFlag(sqlfmtCmd.Flags(), &sqlfmtCtx.execStmts, cliflags.Execute)
-	IntFlag(sqlfmtCmd.Flags(), &sqlfmtCtx.len, cliflags.SQLFmtLen, tree.DefaultPrettyWidth)
-	BoolFlag(sqlfmtCmd.Flags(), &sqlfmtCtx.useSpaces, cliflags.SQLFmtSpaces, false)
-	IntFlag(sqlfmtCmd.Flags(), &sqlfmtCtx.tabWidth, cliflags.SQLFmtTabWidth, 4)
-	BoolFlag(sqlfmtCmd.Flags(), &sqlfmtCtx.noSimplify, cliflags.SQLFmtNoSimplify, true)
+	cfg := tree.DefaultPrettyCfg()
+	IntFlag(sqlfmtCmd.Flags(), &sqlfmtCtx.len, cliflags.SQLFmtLen, cfg.LineWidth)
+	BoolFlag(sqlfmtCmd.Flags(), &sqlfmtCtx.useSpaces, cliflags.SQLFmtSpaces, !cfg.UseTabs)
+	IntFlag(sqlfmtCmd.Flags(), &sqlfmtCtx.tabWidth, cliflags.SQLFmtTabWidth, cfg.TabWidth)
+	BoolFlag(sqlfmtCmd.Flags(), &sqlfmtCtx.noSimplify, cliflags.SQLFmtNoSimplify, !cfg.Simplify)
+	BoolFlag(sqlfmtCmd.Flags(), &sqlfmtCtx.align, cliflags.SQLFmtAlign, (cfg.Align != tree.PrettyNoAlign))
 
 	// Debug commands.
 	{

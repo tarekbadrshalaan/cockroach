@@ -30,7 +30,9 @@ func (b *Builder) constructProjectForScope(inScope, projectionsScope *scope) {
 	if projectionsScope.hasSameColumns(inScope) {
 		projectionsScope.group = inScope.group
 	} else {
-		projectionsScope.group = b.constructProject(inScope.group, projectionsScope.cols)
+		projectionsScope.group = b.constructProject(
+			inScope.group, append(projectionsScope.cols, projectionsScope.orderByCols...),
+		)
 	}
 }
 
@@ -162,7 +164,7 @@ func (b *Builder) finishBuildScalar(
 	if col := outScope.findExistingCol(texpr); col != nil {
 		col = outScope.appendColumn(col, label)
 		col.group = group
-		return
+		return group
 	}
 
 	b.synthesizeColumn(outScope, label, texpr.ResolvedType(), texpr, group)
@@ -185,6 +187,10 @@ func (b *Builder) finishBuildScalar(
 func (b *Builder) finishBuildScalarRef(
 	col *scopeColumn, label string, inScope, outScope *scope,
 ) (out memo.GroupID) {
+	isOuterColumn := inScope.isOuterColumn(col.id)
+	// Remember whether the query was correlated for later.
+	b.IsCorrelated = b.IsCorrelated || isOuterColumn
+
 	// If this is not a projection context, then wrap the column reference with
 	// a Variable expression that can be embedded in outer expression(s).
 	if outScope == nil {
@@ -193,7 +199,7 @@ func (b *Builder) finishBuildScalarRef(
 
 	// Outer columns must be wrapped in a variable expression and assigned a new
 	// column id before projection.
-	if inScope.isOuterColumn(col.id) {
+	if isOuterColumn {
 		// Avoid synthesizing a new column if possible.
 		existing := outScope.findExistingCol(col)
 		if existing == nil {

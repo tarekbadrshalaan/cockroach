@@ -62,6 +62,8 @@ func mapPrivateType(typ string) string {
 		return "*memo.ProjectionsOpDef"
 	case "ScanOpDef":
 		return "*memo.ScanOpDef"
+	case "VirtualScanOpDef":
+		return "*memo.VirtualScanOpDef"
 	case "GroupByDef":
 		return "*memo.GroupByDef"
 	case "IndexJoinDef":
@@ -78,6 +80,8 @@ func mapPrivateType(typ string) string {
 		return "*memo.ShowTraceOpDef"
 	case "MergeOnDef":
 		return "*memo.MergeOnDef"
+	case "TupleOrdinal":
+		return "memo.TupleOrdinal"
 	case "Datum":
 		return "tree.Datum"
 	case "Type":

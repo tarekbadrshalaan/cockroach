@@ -91,13 +91,16 @@ func (b *Builder) buildRelational(ev memo.ExprView) (execPlan, error) {
 	case opt.ScanOp:
 		ep, err = b.buildScan(ev)
 
+	case opt.VirtualScanOp:
+		ep, err = b.buildVirtualScan(ev)
+
 	case opt.SelectOp:
 		ep, err = b.buildSelect(ev)
 
 	case opt.ProjectOp:
 		ep, err = b.buildProject(ev)
 
-	case opt.GroupByOp:
+	case opt.GroupByOp, opt.ScalarGroupByOp:
 		ep, err = b.buildGroupBy(ev)
 
 	case opt.UnionOp, opt.IntersectOp, opt.ExceptOp,
@@ -113,6 +116,9 @@ func (b *Builder) buildRelational(ev memo.ExprView) (execPlan, error) {
 	case opt.IndexJoinOp:
 		ep, err = b.buildIndexJoin(ev)
 
+	case opt.LookupJoinOp:
+		ep, err = b.buildLookupJoin(ev)
+
 	case opt.ExplainOp:
 		ep, err = b.buildExplain(ev)
 
@@ -124,6 +130,9 @@ func (b *Builder) buildRelational(ev memo.ExprView) (execPlan, error) {
 
 	case opt.MergeJoinOp:
 		ep, err = b.buildMergeJoin(ev)
+
+	case opt.ZipOp:
+		ep, err = b.buildZip(ev)
 
 	default:
 		if ev.IsJoinNonApply() {
@@ -192,7 +201,8 @@ func (b *Builder) constructValues(
 }
 
 // getColumns returns the set of column ordinals in the table for the set of
-// column IDs, along with a mapping from the column IDs to output ordinals.
+// column IDs, along with a mapping from the column IDs to output ordinals
+// (starting with outputOrdinalStart).
 func (*Builder) getColumns(
 	md *opt.Metadata, cols opt.ColSet, tableID opt.TableID,
 ) (exec.ColumnOrdinalSet, opt.ColMap) {
@@ -213,7 +223,7 @@ func (*Builder) getColumns(
 	return needed, output
 }
 
-func (b *Builder) makeSQLOrdering(
+func (b *Builder) makeSQLOrderingFromChoice(
 	plan execPlan, ordering *props.OrderingChoice,
 ) sqlbase.ColumnOrdering {
 	if ordering.Any() {
@@ -233,6 +243,20 @@ func (b *Builder) makeSQLOrdering(
 	return reqOrder
 }
 
+func (b *Builder) makeSQLOrdering(plan execPlan, ordering opt.Ordering) sqlbase.ColumnOrdering {
+	colOrder := make(sqlbase.ColumnOrdering, len(ordering))
+	for i := range ordering {
+		colOrder[i].ColIdx = int(plan.getColumnOrdinal(ordering[i].ID()))
+		if ordering[i].Descending() {
+			colOrder[i].Direction = encoding.Descending
+		} else {
+			colOrder[i].Direction = encoding.Ascending
+		}
+	}
+
+	return colOrder
+}
+
 func (b *Builder) buildScan(ev memo.ExprView) (execPlan, error) {
 	def := ev.Private().(*memo.ScanOpDef)
 	md := ev.Metadata()
@@ -241,7 +265,7 @@ func (b *Builder) buildScan(ev memo.ExprView) (execPlan, error) {
 	needed, output := b.getColumns(md, def.Cols, def.Table)
 	res := execPlan{outputCols: output}
 
-	reqOrder := b.makeSQLOrdering(res, &ev.Physical().Ordering)
+	reqOrder := b.makeSQLOrderingFromChoice(res, &ev.Physical().Ordering)
 
 	root, err := b.factory.ConstructScan(
 		tab,
@@ -252,6 +276,22 @@ func (b *Builder) buildScan(ev memo.ExprView) (execPlan, error) {
 		def.Reverse,
 		reqOrder,
 	)
+	if err != nil {
+		return execPlan{}, err
+	}
+	res.root = root
+	return res, nil
+}
+
+func (b *Builder) buildVirtualScan(ev memo.ExprView) (execPlan, error) {
+	def := ev.Private().(*memo.VirtualScanOpDef)
+	md := ev.Metadata()
+	tab := md.Table(def.Table)
+
+	_, output := b.getColumns(md, def.Cols, def.Table)
+	res := execPlan{outputCols: output}
+
+	root, err := b.factory.ConstructVirtualScan(tab)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -354,8 +394,8 @@ func (b *Builder) buildMergeJoin(ev memo.ExprView) (execPlan, error) {
 	if err != nil {
 		return execPlan{}, err
 	}
-	leftOrd := b.makeSQLOrdering(left, &def.LeftEq)
-	rightOrd := b.makeSQLOrdering(right, &def.RightEq)
+	leftOrd := b.makeSQLOrdering(left, def.LeftEq)
+	rightOrd := b.makeSQLOrdering(right, def.RightEq)
 	ep := execPlan{outputCols: outputCols}
 	ep.root, err = b.factory.ConstructMergeJoin(
 		joinType, left.root, right.root, onExpr, leftOrd, rightOrd,
@@ -382,14 +422,7 @@ func (b *Builder) initJoinBuild(
 		return execPlan{}, execPlan{}, nil, opt.ColMap{}, err
 	}
 
-	// Calculate the outputCols map for the join plan: the first numLeftCols
-	// correspond to the columns from the left, the rest correspond to columns
-	// from the right (except for Anti and Semi joins).
-	numLeftCols := leftPlan.outputCols.Len()
-	allCols := leftPlan.outputCols.Copy()
-	rightPlan.outputCols.ForEach(func(colIdx, rightIdx int) {
-		allCols.Set(colIdx, rightIdx+numLeftCols)
-	})
+	allCols := joinOutputMap(leftPlan.outputCols, rightPlan.outputCols)
 
 	ctx := buildScalarCtx{
 		ivh:     tree.MakeIndexedVarHelper(nil /* container */, allCols.Len()),
@@ -405,6 +438,17 @@ func (b *Builder) initJoinBuild(
 		return leftPlan, rightPlan, onExpr, leftPlan.outputCols, nil
 	}
 	return leftPlan, rightPlan, onExpr, allCols, nil
+}
+
+// joinOutputMap determines the outputCols map for a (non-semi/anti) join, given
+// the outputCols maps for its inputs.
+func joinOutputMap(left, right opt.ColMap) opt.ColMap {
+	numLeftCols := left.Len()
+	res := left.Copy()
+	right.ForEach(func(colIdx, rightIdx int) {
+		res.Set(colIdx, rightIdx+numLeftCols)
+	})
+	return res
 }
 
 func joinOpToJoinType(op opt.Operator) sqlbase.JoinType {
@@ -437,17 +481,16 @@ func (b *Builder) buildGroupBy(ev memo.ExprView) (execPlan, error) {
 	if err != nil {
 		return execPlan{}, err
 	}
-	aggregations := ev.Child(1)
-	numAgg := aggregations.ChildCount()
-	groupingCols := ev.Private().(*memo.GroupByDef).GroupingCols
-
-	groupingColIdx := make([]exec.ColumnOrdinal, 0, groupingCols.Len())
 	var ep execPlan
+	groupingCols := ev.Private().(*memo.GroupByDef).GroupingCols
+	groupingColIdx := make([]exec.ColumnOrdinal, 0, groupingCols.Len())
 	for i, ok := groupingCols.Next(0); ok; i, ok = groupingCols.Next(i + 1) {
 		ep.outputCols.Set(i, len(groupingColIdx))
 		groupingColIdx = append(groupingColIdx, input.getColumnOrdinal(opt.ColumnID(i)))
 	}
 
+	aggregations := ev.Child(1)
+	numAgg := aggregations.ChildCount()
 	aggColList := aggregations.Private().(opt.ColList)
 	aggInfos := make([]exec.AggInfo, numAgg)
 	for i := 0; i < numAgg; i++ {
@@ -473,7 +516,11 @@ func (b *Builder) buildGroupBy(ev memo.ExprView) (execPlan, error) {
 		ep.outputCols.Set(int(aggColList[i]), len(groupingColIdx)+i)
 	}
 
-	ep.root, err = b.factory.ConstructGroupBy(input.root, groupingColIdx, aggInfos)
+	if ev.Operator() == opt.ScalarGroupByOp {
+		ep.root, err = b.factory.ConstructScalarGroupBy(input.root, aggInfos)
+	} else {
+		ep.root, err = b.factory.ConstructGroupBy(input.root, groupingColIdx, aggInfos)
+	}
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -642,7 +689,7 @@ func (b *Builder) buildIndexJoin(ev memo.ExprView) (execPlan, error) {
 	// be in the needed set, so no need to add anything further to that.
 	var reqOrder sqlbase.ColumnOrdering
 	if ordering == nil {
-		reqOrder = b.makeSQLOrdering(res, &ev.Physical().Ordering)
+		reqOrder = b.makeSQLOrderingFromChoice(res, &ev.Physical().Ordering)
 	}
 
 	res.root, err = b.factory.ConstructIndexJoin(input.root, md.Table(def.Table), needed, reqOrder)
@@ -664,6 +711,99 @@ func (b *Builder) buildIndexJoin(ev memo.ExprView) (execPlan, error) {
 		}
 	}
 	return res, nil
+}
+
+func (b *Builder) buildLookupJoin(ev memo.ExprView) (execPlan, error) {
+	input, err := b.buildRelational(ev.Child(0))
+	if err != nil {
+		return execPlan{}, err
+	}
+
+	md := ev.Metadata()
+	def := ev.Private().(*memo.LookupJoinDef)
+
+	keyCols := make([]exec.ColumnOrdinal, len(def.KeyCols))
+	for i, c := range def.KeyCols {
+		keyCols[i] = input.getColumnOrdinal(c)
+	}
+
+	lookupCols, lookupColMap := b.getColumns(md, def.LookupCols, def.Table)
+	allCols := joinOutputMap(input.outputCols, lookupColMap)
+
+	res := execPlan{outputCols: allCols}
+
+	// Get sort *result column* ordinals. Don't confuse these with *table column*
+	// ordinals, which are used by the needed set. The sort columns should already
+	// be in the needed set, so no need to add anything further to that.
+	reqOrder := b.makeSQLOrderingFromChoice(res, &ev.Physical().Ordering)
+
+	ctx := buildScalarCtx{
+		ivh:     tree.MakeIndexedVarHelper(nil /* container */, allCols.Len()),
+		ivarMap: allCols,
+	}
+	onExpr, err := b.buildScalar(&ctx, ev.Child(1))
+	if err != nil {
+		return execPlan{}, err
+	}
+
+	tab := md.Table(def.Table)
+	res.root, err = b.factory.ConstructLookupJoin(
+		joinOpToJoinType(def.JoinType),
+		input.root,
+		tab,
+		tab.Index(def.Index),
+		keyCols,
+		lookupCols,
+		onExpr,
+		reqOrder,
+	)
+	if err != nil {
+		return execPlan{}, err
+	}
+	return res, nil
+}
+
+func (b *Builder) buildZip(ev memo.ExprView) (execPlan, error) {
+	exprs := make(tree.TypedExprs, ev.ChildCount())
+	var err error
+	scalarCtx := buildScalarCtx{}
+	for i := range exprs {
+		exprs[i], err = b.buildScalar(&scalarCtx, ev.Child(i))
+		if err != nil {
+			return execPlan{}, err
+		}
+	}
+
+	md := ev.Metadata()
+	cols := ev.Private().(opt.ColList)
+	resultCols := make(sqlbase.ResultColumns, len(cols))
+	for i, col := range cols {
+		resultCols[i].Name = md.ColumnLabel(col)
+		resultCols[i].Typ = md.ColumnType(col)
+	}
+
+	// TODO(rytaft): We currently construct a ProjectSet with an empty Values
+	// node as input, which is correct when the SRFs and/or scalar functions in
+	// this Zip expression were originally in the FROM clause. Once we support
+	// SRFs in the SELECT list, the Zip may be on the right hand side of an
+	// InnerJoinApply operator. In this case, we will need to pass the left hand
+	// side of the join as input to ConstructProjectSet.
+	input, err := b.factory.ConstructValues([][]tree.TypedExpr{{}}, nil)
+	if err != nil {
+		return execPlan{}, err
+	}
+
+	node, err := b.factory.ConstructProjectSet(input, exprs, resultCols)
+	if err != nil {
+		return execPlan{}, err
+	}
+
+	ep := execPlan{root: node}
+	for i, col := range cols {
+		ep.outputCols.Set(int(col), i)
+	}
+
+	return ep, nil
 }
 
 // needProjection figures out what projection is needed on top of the input plan
@@ -787,7 +927,7 @@ func (b *Builder) buildShowTrace(ev memo.ExprView) (execPlan, error) {
 func (b *Builder) buildSortedInput(
 	input execPlan, ordering *props.OrderingChoice,
 ) (execPlan, error) {
-	colOrd := b.makeSQLOrdering(input, ordering)
+	colOrd := b.makeSQLOrderingFromChoice(input, ordering)
 	node, err := b.factory.ConstructSort(input.root, colOrd)
 	if err != nil {
 		return execPlan{}, err

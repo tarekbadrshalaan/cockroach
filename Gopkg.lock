@@ -242,7 +242,7 @@
   branch = "master"
   name = "github.com/cockroachdb/crlfmt"
   packages = ["."]
-  revision = "ea27cb9045ae7c4e7e63926df6300454e3d6f3d8"
+  revision = "5895607e5ea790fcbb640260129a12d277b34e46"
 
 [[projects]]
   branch = "master"
@@ -275,7 +275,7 @@
     "raft",
     "raft/raftpb",
   ]
-  revision = "ce0ad377d21819592c3d8c29417d9d7a5ac53f2f"
+  revision = "b56fc94829d989589a71a64d89494614217b65a7"
 
 [[projects]]
   name = "github.com/cpuguy83/go-md2man"
@@ -568,7 +568,7 @@
   branch = "master"
   name = "github.com/google/btree"
   packages = ["."]
-  revision = "316fb6d3f031ae8f4d457c6c5186b9e3ded70435"
+  revision = "e89373fe6b4a7413d7acd6da1725b83ef713e6e4"
 
 [[projects]]
   name = "github.com/google/go-github"
@@ -1048,29 +1048,10 @@
   version = "v1.1.4"
 
 [[projects]]
-  name = "github.com/tebeka/go2xunit"
-  packages = ["lib"]
-  revision = "dd64c3313b8aef16e869ef93eb970221aefb7549"
-  version = "v1.4.5"
-
-[[projects]]
   branch = "master"
   name = "github.com/wadey/gocovmerge"
   packages = ["."]
   revision = "b5bfa59ec0adc420475f97f89b58045c721d761c"
-
-[[projects]]
-  branch = "master"
-  name = "github.com/xwb1989/sqlparser"
-  packages = [
-    ".",
-    "dependency/bytes2",
-    "dependency/hack",
-    "dependency/querypb",
-    "dependency/sqltypes",
-  ]
-  revision = "6aff8615a33faf1f260a3a8f800456511505d5fd"
-  source = "https://github.com/dt/sqlparser"
 
 [[projects]]
   name = "go.opencensus.io"
@@ -1307,9 +1288,26 @@
   revision = "d73ab98e7c39fdcf9ba65062e43d34310f198353"
   version = "2017.2.2"
 
+[[projects]]
+  branch = "no-flag"
+  name = "vitess.io/vitess"
+  packages = [
+    "go/bytes2",
+    "go/hack",
+    "go/sqltypes",
+    "go/vt/proto/query",
+    "go/vt/proto/topodata",
+    "go/vt/proto/vtgate",
+    "go/vt/proto/vtrpc",
+    "go/vt/sqlparser",
+    "go/vt/vterrors",
+  ]
+  revision = "9b771c0853f6c6443569a8f14a5e8cdb57ffcbd1"
+  source = "https://github.com/cockroachdb/vitess"
+
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "6dd969b1491fd706f2daf81ae63b5d18fea95986d977811a438b3ed50bbd936a"
+  inputs-digest = "b827f3b21201b3e823cb4ad015a30496788510cf54dfdb3533cc8b79b0ea553f"
   solver-name = "gps-cdcl"
   solver-version = 1

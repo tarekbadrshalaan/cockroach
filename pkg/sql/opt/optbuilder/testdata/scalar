@@ -211,47 +211,46 @@ eq [type=bool]
  └── const: 2 [type=int]
 
 
-# TODO(justin): re-enable when we support JSON ops.
-# build-scalar vars=(jsonb)
-# @1 @> '{"a":1}'
-# ----
-# contains [type=bool]
-#  ├── variable: @1 [type=jsonb]
-#  └── const: '{"a": 1}' [type=jsonb]
+build-scalar vars=(jsonb)
+@1 @> '{"a":1}'
+----
+contains [type=bool]
+ ├── variable: @1 [type=jsonb]
+ └── const: '{"a": 1}' [type=jsonb]
 
-# build-scalar vars=(jsonb)
-# '{"a":1}' <@ @1
-# ----
-# contains [type=bool]
-#  ├── variable: @1 [type=jsonb]
-#  └── const: '{"a": 1}' [type=jsonb]
+build-scalar vars=(jsonb)
+'{"a":1}' <@ @1
+----
+contains [type=bool]
+ ├── variable: @1 [type=jsonb]
+ └── const: '{"a": 1}' [type=jsonb]
 
-# build-scalar vars=(jsonb)
-# @1 ? 'a'
-# ----
-# json-exists [type=bool]
-#  ├── variable: @1 [type=jsonb]
-#  └── const: 'a' [type=string]
+build-scalar vars=(jsonb)
+@1 ? 'a'
+----
+json-exists [type=bool]
+ ├── variable: @1 [type=jsonb]
+ └── const: 'a' [type=string]
 
-# build-scalar vars=(jsonb)
-# @1 ?| ARRAY['a', 'b', 'c']
-# ----
-# json-some-exists [type=bool]
-#  ├── variable: @1 [type=jsonb]
-#  └── array: string[] [type=string[]]
-#       ├── const: 'a' [type=string]
-#       ├── const: 'b' [type=string]
-#       └── const: 'c' [type=string]
+build-scalar vars=(jsonb)
+@1 ?| ARRAY['a', 'b', 'c']
+----
+json-some-exists [type=bool]
+ ├── variable: @1 [type=jsonb]
+ └── array: [type=string[]]
+      ├── const: 'a' [type=string]
+      ├── const: 'b' [type=string]
+      └── const: 'c' [type=string]
 
-# build-scalar vars=(jsonb)
-# @1 ?& ARRAY['a', 'b', 'c']
-# ----
-# json-all-exists [type=bool]
-#  ├── variable: @1 [type=jsonb]
-#  └── array: string[] [type=string[]]
-#       ├── const: 'a' [type=string]
-#       ├── const: 'b' [type=string]
-#       └── const: 'c' [type=string]
+build-scalar vars=(jsonb)
+@1 ?& ARRAY['a', 'b', 'c']
+----
+json-all-exists [type=bool]
+ ├── variable: @1 [type=jsonb]
+ └── array: [type=string[]]
+      ├── const: 'a' [type=string]
+      ├── const: 'b' [type=string]
+      └── const: 'c' [type=string]
 
 build-scalar
 TRUE
@@ -591,7 +590,7 @@ build-scalar vars=(int[])
 ----
 eq [type=bool]
  ├── variable: @1 [type=int[]]
- └── array: int[] [type=int[]]
+ └── array: [type=int[]]
       ├── const: 1 [type=int]
       ├── const: 2 [type=int]
       └── const: 3 [type=int]
@@ -601,7 +600,7 @@ build-scalar vars=(int[])
 ----
 eq [type=bool]
  ├── variable: @1 [type=int[]]
- └── array: int[] [type=int[]]
+ └── array: [type=int[]]
       ├── const: 1 [type=int]
       ├── const: 1 [type=int]
       └── const: 1 [type=int]
@@ -611,7 +610,7 @@ build-scalar vars=(float[])
 ----
 eq [type=bool]
  ├── variable: @1 [type=float[]]
- └── array: float[] [type=float[]]
+ └── array: [type=float[]]
       ├── const: 1.0 [type=float]
       ├── const: 1.1 [type=float]
       └── const: 1.123 [type=float]
@@ -621,56 +620,55 @@ build-scalar vars=(int[])
 ----
 eq [type=bool]
  ├── variable: @1 [type=int[]]
- └── array: int[] [type=int[]]
+ └── array: [type=int[]]
 
 build-scalar vars=(string[])
 @1 = ARRAY['foo', 'bar', 'baz']
 ----
 eq [type=bool]
  ├── variable: @1 [type=string[]]
- └── array: string[] [type=string[]]
+ └── array: [type=string[]]
       ├── const: 'foo' [type=string]
       ├── const: 'bar' [type=string]
       └── const: 'baz' [type=string]
 
-# TODO(justin): re-enable when we support JSON ops.
-# build-scalar vars=(json)
-# @1->>'a' = 'b'
-# ----
-# eq [type=bool]
-#  ├── fetch-text [type=string]
-#  │    ├── variable: @1 [type=jsonb]
-#  │    └── const: 'a' [type=string]
-#  └── const: 'b' [type=string]
+build-scalar vars=(json)
+@1->>'a' = 'b'
+----
+eq [type=bool]
+ ├── fetch-text [type=string]
+ │    ├── variable: @1 [type=jsonb]
+ │    └── const: 'a' [type=string]
+ └── const: 'b' [type=string]
 
-# build-scalar vars=(json)
-# @1->'a' = '"b"'
-# ----
-# eq [type=bool]
-#  ├── fetch-val [type=jsonb]
-#  │    ├── variable: @1 [type=jsonb]
-#  │    └── const: 'a' [type=string]
-#  └── const: '"b"' [type=jsonb]
+build-scalar vars=(json)
+@1->'a' = '"b"'
+----
+eq [type=bool]
+ ├── fetch-val [type=jsonb]
+ │    ├── variable: @1 [type=jsonb]
+ │    └── const: 'a' [type=string]
+ └── const: '"b"' [type=jsonb]
 
-# build-scalar vars=(json)
-# @1#>ARRAY['a'] = '"b"'
-# ----
-# eq [type=bool]
-#  ├── fetch-val-path [type=jsonb]
-#  │    ├── variable: @1 [type=jsonb]
-#  │    └── array: string[] [type=string[]]
-#  │         └── const: 'a' [type=string]
-#  └── const: '"b"' [type=jsonb]
+build-scalar vars=(json)
+@1#>ARRAY['a'] = '"b"'
+----
+eq [type=bool]
+ ├── fetch-val-path [type=jsonb]
+ │    ├── variable: @1 [type=jsonb]
+ │    └── array: [type=string[]]
+ │         └── const: 'a' [type=string]
+ └── const: '"b"' [type=jsonb]
 
-# build-scalar vars=(json)
-# @1#>>ARRAY['a'] = 'b'
-# ----
-# eq [type=bool]
-#  ├── fetch-text-path [type=string]
-#  │    ├── variable: @1 [type=jsonb]
-#  │    └── array: string[] [type=string[]]
-#  │         └── const: 'a' [type=string]
-#  └── const: 'b' [type=string]
+build-scalar vars=(json)
+@1#>>ARRAY['a'] = 'b'
+----
+eq [type=bool]
+ ├── fetch-text-path [type=string]
+ │    ├── variable: @1 [type=jsonb]
+ │    └── array: [type=string[]]
+ │         └── const: 'a' [type=string]
+ └── const: 'b' [type=string]
 
 build-scalar vars=(json, json)
 @1 || @2
@@ -693,7 +691,7 @@ build-scalar
 ARRAY[1, 2] || NULL
 ----
 concat [type=int[]]
- ├── array: int[] [type=int[]]
+ ├── array: [type=int[]]
  │    ├── const: 1 [type=int]
  │    └── const: 2 [type=int]
  └── cast: INT[] [type=int[]]
@@ -705,7 +703,7 @@ NULL || ARRAY[1, 2]
 concat [type=int[]]
  ├── cast: INT[] [type=int[]]
  │    └── null [type=unknown]
- └── array: int[] [type=int[]]
+ └── array: [type=int[]]
       ├── const: 1 [type=int]
       └── const: 2 [type=int]
 
@@ -713,7 +711,7 @@ build-scalar
 ARRAY[1, 2] || NULL::smallint
 ----
 concat [type=int[]]
- ├── array: int[] [type=int[]]
+ ├── array: [type=int[]]
  │    ├── const: 1 [type=int]
  │    └── const: 2 [type=int]
  └── cast: SMALLINT [type=int]
@@ -725,7 +723,7 @@ NULL::oid || ARRAY[1, 2]
 concat [type=oid[]]
  ├── cast: OID [type=oid]
  │    └── null [type=unknown]
- └── array: oid[] [type=oid[]]
+ └── array: [type=oid[]]
       ├── const: 1 [type=oid]
       └── const: 2 [type=oid]
 
@@ -745,7 +743,7 @@ SELECT -((-9223372036854775808):::int)
 project
  ├── columns: "?column?":1(int)
  ├── values
- │    └── tuple [type=tuple{}]
+ │    └── tuple [type=tuple]
  └── projections
       └── unary-minus [type=int]
            └── const: -9223372036854775808 [type=int]

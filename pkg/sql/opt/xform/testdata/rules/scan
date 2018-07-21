@@ -7,7 +7,8 @@ CREATE TABLE a
     s STRING,
     j JSON,
     INDEX s_idx (s) STORING (i, f),
-    INDEX si_idx (s DESC, i DESC) STORING (j)
+    INDEX si_idx (s DESC, i DESC) STORING (j),
+    INVERTED INDEX inv_idx_j (j)
 )
 ----
 TABLE a
@@ -23,11 +24,14 @@ TABLE a
  │    ├── k int not null
  │    ├── i int (storing)
  │    └── f float (storing)
- └── INDEX si_idx
-      ├── s string desc
-      ├── i int desc
-      ├── k int not null
-      └── j jsonb (storing)
+ ├── INDEX si_idx
+ │    ├── s string desc
+ │    ├── i int desc
+ │    ├── k int not null
+ │    └── j jsonb (storing)
+ └── INVERTED INDEX inv_idx_j
+      ├── j jsonb
+      └── k int not null
 
 # --------------------------------------------------
 # GenerateIndexScans
@@ -311,22 +315,6 @@ New expression 5 of 5:
              ├── columns: k:1(int!null) i:2(int) s:4(string)
              ├── key: (1)
              └── fd: (1)-->(2,4)
-
-================================================================================
-GenerateIndexScans
-================================================================================
-Source expression:
-  sort
-   ├── columns: s:4(string) i:2(int) f:3(float)
-   ├── key: (1)
-   ├── fd: (1)-->(2-4)
-   ├── ordering: +4,+1
-   └── scan a,rev
-        ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string)
-        ├── key: (1)
-        └── fd: (1)-->(2-4)
-
-No new expressions.
 ----
 ----
 

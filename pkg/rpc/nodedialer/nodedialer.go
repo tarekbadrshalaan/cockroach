@@ -26,7 +26,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
@@ -38,32 +40,42 @@ type wrappedBreaker struct {
 	log.EveryN
 }
 
-// A NodeAddressResolver translates NodeIDs into addresses.
-type NodeAddressResolver func(roachpb.NodeID) (net.Addr, error)
+// An AddressResolver translates NodeIDs into addresses.
+type AddressResolver func(roachpb.NodeID) (net.Addr, error)
 
-// A NodeDialer wraps an *rpc.Context for dialing based on node IDs. For each node,
+// A Dialer wraps an *rpc.Context for dialing based on node IDs. For each node,
 // it maintains a circuit breaker that prevents rapid connection attempts and
 // provides hints to the callers on whether to log the outcome of the operation.
-type NodeDialer struct {
+type Dialer struct {
 	rpcContext *rpc.Context
-	resolver   NodeAddressResolver
+	resolver   AddressResolver
 
 	breakers syncutil.IntMap // map[roachpb.NodeID]*wrappedBreaker
 }
 
-// NewNodeDialer initializes a NodeDialer.
-func NewNodeDialer(rpcContext *rpc.Context, resolver NodeAddressResolver) *NodeDialer {
-	return &NodeDialer{
+// New initializes a Dialer.
+func New(rpcContext *rpc.Context, resolver AddressResolver) *Dialer {
+	return &Dialer{
 		rpcContext: rpcContext,
 		resolver:   resolver,
 	}
 }
 
-// DialNode returns a grpc connection to the given node. It logs whenever the
+// Stopper returns this node dialer's Stopper.
+// TODO(bdarnell): This is a bit of a hack for kv/transport_race.go
+func (n *Dialer) Stopper() *stop.Stopper {
+	return n.rpcContext.Stopper
+}
+
+// Silence lint warning because this method is only used in race builds.
+var _ = (*Dialer).Stopper
+
+// Dial returns a grpc connection to the given node. It logs whenever the
 // node first becomes unreachable or reachable.
-func (n *NodeDialer) DialNode(
-	ctx context.Context, nodeID roachpb.NodeID,
-) (_ *grpc.ClientConn, err error) {
+func (n *Dialer) Dial(ctx context.Context, nodeID roachpb.NodeID) (_ *grpc.ClientConn, err error) {
+	if n == nil || n.resolver == nil {
+		return nil, errors.New("no node dialer configured")
+	}
 	breaker := n.getBreaker(nodeID)
 	// If this is the first time connecting, or if connections have been failing repeatedly,
 	// consider logging.
@@ -99,14 +111,96 @@ func (n *NodeDialer) DialNode(
 	return conn, nil
 }
 
+type internalServerAdapter struct {
+	roachpb.InternalClient
+}
+
+func (a internalServerAdapter) Batch(
+	ctx context.Context, ba *roachpb.BatchRequest,
+) (*roachpb.BatchResponse, error) {
+	return a.InternalClient.Batch(ctx, ba)
+}
+
+var _ roachpb.InternalServer = internalServerAdapter{}
+
+// IsLocal returns true if the given InternalServer is local.
+// TODO(bdarnell): This is a bit of a hack. Once RangeFeed has
+// settled, consider refactoring this so we return an object that
+// wraps all knowledge of local/remote issues instead of returning the
+// GRPC roachpb.InternalServer directly.
+func IsLocal(iface roachpb.InternalServer) bool {
+	_, ok := iface.(internalServerAdapter)
+	return !ok // internalServerAdapter is used for remote connections.
+}
+
+// DialInternalServer is a specialization of Dial for callers that
+// want a roachpb.InternalServer. This supports an optimization to
+// bypass the network for the local node. Returns a context.Context
+// which should be used when making RPC calls on the returned server
+// (This context is annotated to mark this request as in-process and
+// bypass ctx.Peer checks).
+func (n *Dialer) DialInternalServer(
+	ctx context.Context, nodeID roachpb.NodeID,
+) (context.Context, roachpb.InternalServer, error) {
+	if n == nil || n.resolver == nil {
+		return nil, nil, errors.New("no node dialer configured")
+	}
+	addr, err := n.resolver(nodeID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if localServer := n.rpcContext.GetLocalInternalServerForAddr(addr.String()); localServer != nil {
+		log.VEvent(ctx, 2, "sending request to local server")
+
+		// Create a new context from the existing one with the "local request" field set.
+		// This tells the handler that this is an in-process request, bypassing ctx.Peer checks.
+		localCtx := grpcutil.NewLocalRequestContext(ctx)
+
+		return localCtx, localServer, nil
+	}
+
+	log.VEventf(ctx, 2, "sending request to %s", addr)
+	conn, err := n.rpcContext.GRPCDial(addr.String()).Connect(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	// TODO(bdarnell): Reconcile the different health checks and circuit
+	// breaker behavior in this file
+	if err := grpcutil.ConnectionReady(conn); err != nil {
+		return nil, nil, err
+	}
+	return ctx, internalServerAdapter{roachpb.NewInternalClient(conn)}, nil
+}
+
+// ConnHealth returns nil if we have an open connection to the given node
+// that succeeded on its most recent heartbeat. See the method of the same
+// name on rpc.Context for more details.
+func (n *Dialer) ConnHealth(nodeID roachpb.NodeID) error {
+	if n == nil || n.resolver == nil {
+		return errors.New("no node dialer configured")
+	}
+	addr, err := n.resolver(nodeID)
+	if err != nil {
+		return err
+	}
+	// TODO(bdarnell): GRPCDial should detect local addresses and return
+	// a dummy connection instead of requiring callers to do this check.
+	if n.rpcContext.GetLocalInternalServerForAddr(addr.String()) != nil {
+		// The local server is always considered healthy.
+		return nil
+	}
+	conn := n.rpcContext.GRPCDial(addr.String())
+	return conn.Health()
+}
+
 // GetCircuitBreaker retrieves the circuit breaker for connections to the given
 // node. The breaker should not be mutated as this affects all connections
 // dialing to that node through this NodeDialer.
-func (n *NodeDialer) GetCircuitBreaker(nodeID roachpb.NodeID) *circuit.Breaker {
+func (n *Dialer) GetCircuitBreaker(nodeID roachpb.NodeID) *circuit.Breaker {
 	return n.getBreaker(nodeID).Breaker
 }
 
-func (n *NodeDialer) getBreaker(nodeID roachpb.NodeID) *wrappedBreaker {
+func (n *Dialer) getBreaker(nodeID roachpb.NodeID) *wrappedBreaker {
 	value, ok := n.breakers.Load(int64(nodeID))
 	if !ok {
 		breaker := &wrappedBreaker{Breaker: n.rpcContext.NewBreaker(), EveryN: log.Every(logPerNodeFailInterval)}

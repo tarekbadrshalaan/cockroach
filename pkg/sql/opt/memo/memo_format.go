@@ -22,6 +22,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 )
 
@@ -272,9 +273,9 @@ func (f exprFormatter) formatPrivate(private interface{}, mode formatMode) {
 		// Don't output name of index if it's the primary index.
 		tab := f.mem.metadata.Table(t.Table)
 		if t.Index == opt.PrimaryIndex {
-			fmt.Fprintf(f.buf, " %s", tab.TabName())
+			fmt.Fprintf(f.buf, " %s", tab.TabName().TableName)
 		} else {
-			fmt.Fprintf(f.buf, " %s@%s", tab.TabName(), tab.Index(t.Index).IdxName())
+			fmt.Fprintf(f.buf, " %s@%s", tab.TabName().TableName, tab.Index(t.Index).IdxName())
 		}
 		if t.Reverse {
 			fmt.Fprintf(f.buf, ",rev")
@@ -290,6 +291,10 @@ func (f exprFormatter) formatPrivate(private interface{}, mode formatMode) {
 				fmt.Fprintf(f.buf, ",lim=%d", t.HardLimit)
 			}
 		}
+
+	case *VirtualScanOpDef:
+		tab := f.mem.metadata.Table(t.Table)
+		fmt.Fprintf(f.buf, " %s", tab.TabName())
 
 	case *RowNumberDef:
 		if !t.Ordering.Any() {
@@ -307,7 +312,7 @@ func (f exprFormatter) formatPrivate(private interface{}, mode formatMode) {
 
 	case *IndexJoinDef:
 		tab := f.mem.metadata.Table(t.Table)
-		fmt.Fprintf(f.buf, " %s", tab.TabName())
+		fmt.Fprintf(f.buf, " %s", tab.TabName().TableName)
 		if mode == formatMemo {
 			fmt.Fprintf(f.buf, ",cols=%s", t.Cols)
 		}
@@ -315,9 +320,9 @@ func (f exprFormatter) formatPrivate(private interface{}, mode formatMode) {
 	case *LookupJoinDef:
 		tab := f.mem.metadata.Table(t.Table)
 		if t.Index == opt.PrimaryIndex {
-			fmt.Fprintf(f.buf, " %s", tab.TabName())
+			fmt.Fprintf(f.buf, " %s", tab.TabName().TableName)
 		} else {
-			fmt.Fprintf(f.buf, " %s@%s", tab.TabName(), tab.Index(t.Index).IdxName())
+			fmt.Fprintf(f.buf, " %s@%s", tab.TabName().TableName, tab.Index(t.Index).IdxName())
 		}
 		if mode == formatMemo {
 			fmt.Fprintf(f.buf, ",keyCols=%v,lookupCols=%s", t.KeyCols, t.LookupCols)
@@ -351,7 +356,8 @@ func (f exprFormatter) formatPrivate(private interface{}, mode formatMode) {
 			fmt.Fprintf(f.buf, " ordering=%s", t)
 		}
 
-	case *SetOpColMap:
+	case *SetOpColMap, types.T:
+		// Don't show anything, because it's mostly redundant.
 
 	default:
 		fmt.Fprintf(f.buf, " %v", private)

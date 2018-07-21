@@ -153,8 +153,8 @@ func newJoinReader(
 			inputsToDrain: []RowSource{jr.input},
 			trailingMetaCallback: func() []ProducerMetadata {
 				jr.internalClose()
-				if txnMeta := getTxnCoordMeta(jr.flowCtx.txn); txnMeta != nil {
-					return []ProducerMetadata{{TxnMeta: txnMeta}}
+				if meta := getTxnCoordMeta(jr.flowCtx.txn); meta != nil {
+					return []ProducerMetadata{{TxnCoordMeta: meta}}
 				}
 				return nil
 			},
@@ -354,7 +354,9 @@ func (jr *joinReader) readInput() (joinReaderState, *ProducerMetadata) {
 		if row == nil {
 			break
 		}
-		jr.inputRows = append(jr.inputRows, jr.rowAlloc.CopyRow(row))
+		if !jr.hasNullLookupColumn(row) {
+			jr.inputRows = append(jr.inputRows, jr.rowAlloc.CopyRow(row))
+		}
 	}
 
 	if len(jr.inputRows) == 0 {
@@ -380,7 +382,7 @@ func (jr *joinReader) readInput() (joinReaderState, *ProducerMetadata) {
 	}
 	err := jr.fetcher.StartScan(
 		jr.ctx, jr.flowCtx.txn, spans, false /* limitBatches */, 0, /* limitHint */
-		false /* traceKV */)
+		jr.flowCtx.traceKV)
 	if err != nil {
 		jr.moveToDraining(err)
 		return jrStateUnknown, jr.drainHelper()
@@ -510,6 +512,15 @@ func (jr *joinReader) emitRow() (joinReaderState, sqlbase.EncDatumRow, *Producer
 	return jrEmittingRows, row, nil
 }
 
+func (jr *joinReader) hasNullLookupColumn(row sqlbase.EncDatumRow) bool {
+	for _, colIdx := range jr.lookupCols {
+		if row[colIdx].IsNull() {
+			return true
+		}
+	}
+	return false
+}
+
 // primaryLookup looks up the corresponding primary index rows, given a batch of
 // secondary index rows. Since we expect a 1-1 correspondence between the input
 // and output, it returns a slice of rows where each row corresponds to the
@@ -545,7 +556,7 @@ func (jr *joinReader) primaryLookup(
 
 	// Perform the primary index scan.
 	err := jr.primaryFetcher.StartScan(
-		ctx, txn, spans, false /* limitBatches */, 0 /* limitHint */, false /* traceKV */)
+		ctx, txn, spans, false /* limitBatches */, 0 /* limitHint */, jr.flowCtx.traceKV)
 	if err != nil {
 		log.Errorf(ctx, "scan error: %s", err)
 		return nil, err

@@ -113,7 +113,7 @@ func init() {
 		opt.NullOp:            typeAsPrivate,
 		opt.PlaceholderOp:     typeAsTypedExpr,
 		opt.UnsupportedExprOp: typeAsTypedExpr,
-		opt.TupleOp:           typeAsTuple,
+		opt.TupleOp:           typeAsPrivate,
 		opt.ProjectionsOp:     typeAsAny,
 		opt.AggregationsOp:    typeAsAny,
 		opt.MergeOnOp:         typeAsAny,
@@ -126,6 +126,7 @@ func init() {
 		opt.CastOp:            typeCast,
 		opt.SubqueryOp:        typeSubquery,
 		opt.ArrayOp:           typeAsPrivate,
+		opt.ColumnAccessOp:    typeColumnAccess,
 
 		// Override default typeAsAggregate behavior for aggregate functions with
 		// a large number of possible overloads or where ReturnType depends on
@@ -186,17 +187,6 @@ func typeAsBool(_ ExprView) types.T {
 // typeAsFirstArg returns the type of the expression's 0th argument.
 func typeAsFirstArg(ev ExprView) types.T {
 	return ev.Child(0).Logical().Scalar.Type
-}
-
-// typeAsTuple constructs a tuple type that is composed of the types of all the
-// expression's children.
-func typeAsTuple(ev ExprView) types.T {
-	types := types.TTuple{Types: make([]types.T, ev.ChildCount())}
-	for i := 0; i < ev.ChildCount(); i++ {
-		child := ev.Child(i)
-		types.Types[i] = child.Logical().Scalar.Type
-	}
-	return types
 }
 
 // typeAsTypedExpr returns the resolved type of the private field, with the
@@ -302,6 +292,12 @@ func typeAsPrivate(ev ExprView) types.T {
 func typeSubquery(ev ExprView) types.T {
 	colID, _ := ev.Child(0).Logical().Relational.OutputCols.Next(0)
 	return ev.Metadata().ColumnType(opt.ColumnID(colID))
+}
+
+func typeColumnAccess(ev ExprView) types.T {
+	colIdx := ev.Private().(TupleOrdinal)
+	typ := ev.Child(0).Logical().Scalar.Type.(types.TTuple)
+	return typ.Types[colIdx]
 }
 
 // overload encapsulates information about a binary operator overload, to be

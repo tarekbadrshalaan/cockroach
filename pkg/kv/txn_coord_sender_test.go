@@ -29,7 +29,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
@@ -335,15 +334,17 @@ func TestTxnCoordSenderCondenseIntentSpans(t *testing.T) {
 	// Check end transaction intents, which should exclude the intent at
 	// key "c" as it's merged with the cToEClosed span.
 	expIntents := []roachpb.Span{fTog1Closed, cToEClosed, a, b}
-	var sendFn rpcSendFn = func(
-		_ context.Context, _ SendOptions, _ ReplicaSlice, args roachpb.BatchRequest, _ *rpc.Context,
+	var sendFn simpleSendFn = func(
+		_ context.Context, _ SendOptions, _ ReplicaSlice, args roachpb.BatchRequest,
 	) (*roachpb.BatchResponse, error) {
 		if req, ok := args.GetArg(roachpb.EndTransaction); ok {
 			if a, e := req.(*roachpb.EndTransactionRequest).IntentSpans, expIntents; !reflect.DeepEqual(a, e) {
 				t.Errorf("expected end transaction to have intents %+v; got %+v", e, a)
 			}
 		}
-		return args.CreateReply(), nil
+		resp := args.CreateReply()
+		resp.Txn = args.Txn
+		return resp, nil
 	}
 	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
 	ds := NewDistSender(
@@ -351,7 +352,7 @@ func TestTxnCoordSenderCondenseIntentSpans(t *testing.T) {
 			AmbientCtx: ambient,
 			Clock:      s.Clock,
 			TestingKnobs: ClientTestingKnobs{
-				TransportFactory: adaptLegacyTransport(sendFn),
+				TransportFactory: adaptSimpleTransport(sendFn),
 			},
 			RangeDescriptorDB: descDB,
 		},
@@ -842,6 +843,7 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 				pErr := test.pErrGen(ba.Txn)
 				if pErr == nil {
 					reply = ba.CreateReply()
+					reply.Txn = ba.Txn
 				}
 				return reply, pErr
 			}
@@ -1030,7 +1032,8 @@ func TestTxnCoordSenderErrorWithIntent(t *testing.T) {
 			ba.Add(&roachpb.PutRequest{RequestHeader: roachpb.RequestHeader{Key: key}})
 			ba.Add(&roachpb.EndTransactionRequest{})
 			txn := roachpb.MakeTransaction("test", key, 0, 0, clock.Now(), 0)
-			tc := factory.TransactionalSender(client.RootTxn, &txn)
+			meta := roachpb.MakeTxnCoordMeta(txn)
+			tc := factory.TransactionalSender(client.RootTxn, meta)
 			defer teardownHeartbeat(tc.(*TxnCoordSender))
 			ba.Txn = &txn
 			_, pErr := tc.Send(context.Background(), ba)
@@ -1421,8 +1424,7 @@ func TestAbortTransactionOnCommitErrors(t *testing.T) {
 			) (*roachpb.BatchResponse, *roachpb.Error) {
 				br := ba.CreateReply()
 
-				switch req := ba.Requests[0].GetInner().(type) {
-				case *roachpb.BeginTransactionRequest:
+				if _, hasBT := ba.GetArg(roachpb.BeginTransaction); hasBT {
 					if _, ok := ba.Requests[1].GetInner().(*roachpb.PutRequest); !ok {
 						t.Fatalf("expected Put")
 					}
@@ -1436,8 +1438,8 @@ func TestAbortTransactionOnCommitErrors(t *testing.T) {
 						br.Txn.Writing = true
 						br.Txn.Status = roachpb.PENDING
 					}
-				case *roachpb.EndTransactionRequest:
-					if req.Commit {
+				} else if et, hasET := ba.GetArg(roachpb.EndTransaction); hasET {
+					if et.(*roachpb.EndTransactionRequest).Commit {
 						commit.Store(true)
 						if test.errFn != nil {
 							return nil, test.errFn(*ba.Txn)
@@ -1445,7 +1447,7 @@ func TestAbortTransactionOnCommitErrors(t *testing.T) {
 						return nil, roachpb.NewErrorWithTxn(test.err, ba.Txn)
 					}
 					abort.Store(true)
-				default:
+				} else {
 					t.Fatalf("unexpected batch: %s", ba)
 				}
 				return br, nil
@@ -1539,7 +1541,9 @@ func TestRollbackErrorStopsHeartbeat(t *testing.T) {
 
 	sender.match(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		if _, ok := ba.GetArg(roachpb.EndTransaction); !ok {
-			return nil, nil
+			resp := ba.CreateReply()
+			resp.Txn = ba.Txn
+			return resp, nil
 		}
 		return nil, roachpb.NewErrorf("injected err")
 	})
@@ -1701,7 +1705,8 @@ func TestIntentTrackingBeforeBeginTransaction(t *testing.T) {
 		clock.Now(),
 		clock.MaxOffset().Nanoseconds(),
 	)
-	tcs := factory.TransactionalSender(client.RootTxn, &txn)
+	meta := roachpb.MakeTxnCoordMeta(txn)
+	tcs := factory.TransactionalSender(client.RootTxn, meta)
 	txnHeader := roachpb.Header{
 		Txn: &txn,
 	}

@@ -105,7 +105,7 @@ var traceSessionEventLogEnabled = settings.RegisterBoolSetting(
 // OptimizerClusterMode controls the cluster default for when the cost-based optimizer is used.
 var OptimizerClusterMode = settings.RegisterEnumSetting(
 	"sql.defaults.optimizer",
-	"Default cost-based optimizer mode",
+	"default cost-based optimizer mode",
 	"on",
 	map[int64]string{
 		int64(sessiondata.OptimizerLocal): "local",
@@ -117,7 +117,7 @@ var OptimizerClusterMode = settings.RegisterEnumSetting(
 // DistSQLClusterExecMode controls the cluster default for when DistSQL is used.
 var DistSQLClusterExecMode = settings.RegisterEnumSetting(
 	"sql.defaults.distsql",
-	"Default distributed SQL execution mode",
+	"default distributed SQL execution mode",
 	"auto",
 	map[int64]string{
 		int64(sessiondata.DistSQLOff):  "off",
@@ -175,6 +175,18 @@ var (
 		Help:        "Latency of SQL request execution",
 		Measurement: "Latency",
 		Unit:        metric.Unit_NANOSECONDS,
+	}
+	MetaSQLOpt = metric.Metadata{
+		Name:        "sql.optimizer.count",
+		Help:        "Number of statements which ran with the cost-based optimizer",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaSQLOptFallback = metric.Metadata{
+		Name:        "sql.optimizer.fallback.count",
+		Help:        "Number of statements which the cost-based optimizer was unable to plan",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
 	}
 	MetaDistSQLSelect = metric.Metadata{
 		Name:        "sql.distsql.select.count",
@@ -601,12 +613,23 @@ func checkResultType(typ types.T) error {
 
 // EvalAsOfTimestamp evaluates and returns the timestamp from an AS OF SYSTEM
 // TIME clause.
-func EvalAsOfTimestamp(
-	evalCtx *tree.EvalContext, asOf tree.AsOfClause, max hlc.Timestamp,
+func (p *planner) EvalAsOfTimestamp(
+	asOf tree.AsOfClause, max hlc.Timestamp,
 ) (hlc.Timestamp, error) {
-	te, err := asOf.Expr.TypeCheck(nil, types.String)
+	// We need to save and restore the previous value of the field in
+	// semaCtx in case we are recursively called within a subquery
+	// context.
+	scalarProps := &p.semaCtx.Properties
+	defer scalarProps.Restore(*scalarProps)
+	scalarProps.Require("AS OF SYSTEM TIME", tree.RejectSpecial|tree.RejectSubqueries)
+
+	te, err := asOf.Expr.TypeCheck(&p.semaCtx, types.String)
 	if err != nil {
 		return hlc.Timestamp{}, err
+	}
+	evalCtx := p.EvalContext()
+	if !tree.IsConst(evalCtx, te) {
+		return hlc.Timestamp{}, errors.Errorf("AS OF SYSTEM TIME: only constant expressions are allowed")
 	}
 	d, err := te.Eval(evalCtx)
 	if err != nil {
@@ -658,6 +681,16 @@ func EvalAsOfTimestamp(
 	return ts, nil
 }
 
+// ParseHLC parses the string representation of an `hlc.Timestamp` that is
+// accepted by `AS OF SYSTEM TIME`.
+func ParseHLC(s string) (hlc.Timestamp, error) {
+	dec, _, err := apd.NewFromString(s)
+	if err != nil {
+		return hlc.Timestamp{}, err
+	}
+	return decimalToHLC(dec)
+}
+
 func decimalToHLC(d *apd.Decimal) (hlc.Timestamp, error) {
 	// Format the decimal into a string and split on `.` to extract the nanosecond
 	// walltime and logical tick parts.
@@ -699,9 +732,7 @@ func decimalToHLC(d *apd.Decimal) (hlc.Timestamp, error) {
 //
 // max is a lower bound on what the transaction's timestamp will be.
 // Used to check that the user didn't specify a timestamp in the future.
-func isAsOf(
-	stmt tree.Statement, evalCtx *tree.EvalContext, max hlc.Timestamp,
-) (*hlc.Timestamp, error) {
+func (p *planner) isAsOf(stmt tree.Statement, max hlc.Timestamp) (*hlc.Timestamp, error) {
 	var asOf tree.AsOfClause
 	switch s := stmt.(type) {
 	case *tree.Select:
@@ -721,7 +752,6 @@ func isAsOf(
 		}
 
 		asOf = sc.From.AsOf
-
 	case *tree.Scrub:
 		if s.AsOf.Expr == nil {
 			return nil, nil
@@ -731,7 +761,7 @@ func isAsOf(
 		return nil, nil
 	}
 
-	ts, err := EvalAsOfTimestamp(evalCtx, asOf, max)
+	ts, err := p.EvalAsOfTimestamp(asOf, max)
 	return &ts, err
 }
 

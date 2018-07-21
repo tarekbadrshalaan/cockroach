@@ -37,6 +37,11 @@ $(if $(subst -,,$(BENCHES)),$(error BENCHES must be specified with PKG (e.g. PKG
 endif
 endif
 
+TYPE :=
+ifneq "$(TYPE)" ""
+$(error Make no longer understands TYPE. Use 'build/builder.sh mkrelease $(subst release-,,$(TYPE))' instead)
+endif
+
 ## Which package to run tests against, e.g. "./pkg/storage".
 PKG := ./pkg/...
 
@@ -76,9 +81,8 @@ GOFLAGS      :=
 TAGS         :=
 ARCHIVE      := cockroach.src.tgz
 STARTFLAGS   := -s type=mem,size=1GiB --logtostderr
-BUILDMODE    := install
 BUILDTARGET  := ./pkg/cmd/cockroach
-SUFFIX       :=
+SUFFIX       := $(GOEXE)
 INSTALL      := install
 prefix       := /usr/local
 bindir       := $(prefix)/bin
@@ -112,98 +116,28 @@ help: ## Print help for targets with comments.
 		"make testlogic FILES=fk SUBTESTS='20042|20045'" "Run the logic tests within subtests 20042 and 20045 in the file named fk." \
 		"make check-libroach TESTS=ccl" "Run the libroach tests matching .*ccl.*"
 
-# Possible values:
-# <empty>: use the default toolchain
-# release-linux-gnu:     target Linux 2.6.32, dynamically link GLIBC 2.12.2
-# release-linux-musl:    target Linux 2.6.32, statically link musl 1.1.16
-# release-aarch64-linux: target aarch64 Linux 3.7.10, dynamically link GLIBC 2.12.2
-# release-darwin:        target OS X 10.9
-# release-windows:       target Windows 8, statically link all non-Windows libraries
-#
-# All non-empty variants only work in the cockroachdb/builder docker image, as
-# they depend on cross-compilation toolchains available there.
-# The name of the cockroach binary depends on the release type.
-TYPE :=
-
-# We intentionally use LINKFLAGS instead of the more traditional LDFLAGS
-# because LDFLAGS has built-in semantics that don't make sense with the Go
-# toolchain.
-LINKFLAGS ?=
-
-BUILD_TYPE := development
-ifeq ($(TYPE),)
-else ifeq ($(TYPE),msan)
-NATIVE_SUFFIX := _msan
-override GOFLAGS += -msan
-# NB: using jemalloc with msan causes segfaults. See
-# https://github.com/jemalloc/jemalloc/issues/821.
-override TAGS += stdmalloc
-MSAN_CPPFLAGS := -fsanitize=memory -fsanitize-memory-track-origins -fno-omit-frame-pointer -I/libcxx_msan/include -I/libcxx_msan/include/c++/v1
-MSAN_LDFLAGS  := -fsanitize=memory -stdlib=libc++ -L/libcxx_msan/lib -lc++abi -Wl,-rpath,/libcxx_msan/lib
-override CGO_CPPFLAGS += $(MSAN_CPPFLAGS)
-override CGO_LDFLAGS += $(MSAN_LDFLAGS)
-export CGO_CPPFLAGS
-export CGO_LDFLAGS
-# NB: CMake doesn't respect CPPFLAGS (!)
-#
-# See https://bugs.launchpad.net/pantheon-terminal/+bug/1325329.
-override CFLAGS += $(MSAN_CPPFLAGS)
-override CXXFLAGS += $(MSAN_CPPFLAGS)
-override LDFLAGS += $(MSAN_LDFLAGS)
-else ifeq ($(TYPE),release-linux-gnu)
-# We use a custom toolchain to target old Linux and glibc versions. However,
-# this toolchain's libstdc++ version is quite recent and must be statically
-# linked to avoid depending on the target's available libstdc++.
-XHOST_TRIPLE := x86_64-unknown-linux-gnu
-override LDFLAGS = -static-libgcc -static-libstdc++
-override LINKFLAGS += -extldflags "$(LDFLAGS)"
-override SUFFIX := $(SUFFIX)-linux-2.6.32-gnu-amd64
-BUILD_TYPE := release
-else ifeq ($(TYPE),release-linux-musl)
-XHOST_TRIPLE := x86_64-unknown-linux-musl
-override LDFLAGS = -static
-override LINKFLAGS += -extldflags "$(LDFLAGS)"
-override SUFFIX := $(SUFFIX)-linux-2.6.32-musl-amd64
-BUILD_TYPE := release
-else ifeq ($(TYPE),release-aarch64-linux)
-XGOARCH := arm64
-export CGO_ENABLED := 1
-XHOST_TRIPLE := aarch64-unknown-linux-gnueabi
-override LDFLAGS = -static-libgcc -static-libstdc++
-override LINKFLAGS += -extldflags "$(LDFLAGS)"
-override SUFFIX := $(SUFFIX)-linux-3.7.10-gnu-aarch64
-BUILD_TYPE := release
-else ifeq ($(TYPE),release-darwin)
-XGOOS := darwin
-export CGO_ENABLED := 1
-XHOST_TRIPLE := x86_64-apple-darwin13
-override SUFFIX := $(SUFFIX)-darwin-10.9-amd64
-BUILD_TYPE := release
-else ifeq ($(TYPE),release-windows)
-XGOOS := windows
-export CGO_ENABLED := 1
-XHOST_TRIPLE := x86_64-w64-mingw32
-override SUFFIX := $(SUFFIX)-windows-6.2-amd64
-override LDFLAGS += -static
-override LINKFLAGS += -extldflags "$(LDFLAGS)"
-BUILD_TYPE := release
-else
-$(error unknown build type $(TYPE))
-endif
+BUILDTYPE := development
 
 # Build C/C++ with basic debugging information.
 CFLAGS += -g1
 CXXFLAGS += -g1
+LDFLAGS ?=
 
-export CFLAGS
-export CXXFLAGS
-export LDFLAGS
+# TODO(benesch): remove filter-outs below when golang/go#26144 and
+# golang/go#16651, respectively, are fixed.
+CGO_CFLAGS = $(filter-out -g%,$(CFLAGS))
+CGO_CXXFLAGS = $(CXXFLAGS)
+CGO_LDFLAGS = $(filter-out -static,$(LDFLAGS))
 
-override LINKFLAGS += -X github.com/cockroachdb/cockroach/pkg/build.typ=$(BUILD_TYPE)
+export CFLAGS CXXFLAGS LDFLAGS CGO_CFLAGS CGO_CXXFLAGS CGO_LDFLAGS
+
+# We intentionally use LINKFLAGS instead of the more traditional LDFLAGS
+# because LDFLAGS has built-in semantics that don't make sense with the Go
+# toolchain.
+override LINKFLAGS = -X github.com/cockroachdb/cockroach/pkg/build.typ=$(BUILDTYPE) -extldflags "$(LDFLAGS)"
 
 GO      ?= go
 GOFLAGS ?=
-XGO     ?= xgo
 TAR     ?= tar
 
 # Ensure we have an unambiguous GOPATH.
@@ -263,17 +197,6 @@ NODE_RUN := build/node-run.sh
 # used. See: http://blog.jgc.org/2016/07/lazy-gnu-make-variables.html
 override make-lazy = $(eval $1 = $$(eval $1 := $(value $1))$$($1))
 
-MACOS := $(findstring Darwin,$(UNAME))
-MINGW := $(findstring MINGW,$(UNAME))
-
-ifdef MACOS
-# On macOS 10.11, XCode SDK v8.1 (and possibly others) indicate the presence of
-# symbols that don't exist until macOS 10.12. Setting MACOSX_DEPLOYMENT_TARGET
-# to the host machine's actual macOS version works around this. See:
-# https://github.com/jemalloc/jemalloc/issues/494.
-export MACOSX_DEPLOYMENT_TARGET ?= $(macos-version)
-endif
-
 # GNU tar and BSD tar both support transforming filenames according to a regular
 # expression, but have different flags to do so.
 TAR_XFORM_FLAG = $(shell $(TAR) --version | grep -q GNU && echo "--xform='flags=r;s'" || echo "-s")
@@ -283,6 +206,10 @@ $(call make-lazy,TAR_XFORM_FLAG)
 # while BSD sed requires an empty string as the following argument.
 SED_INPLACE = sed $(shell sed --version 2>&1 | grep -q GNU && echo -i || echo "-i ''")
 $(call make-lazy,SED_INPLACE)
+
+# MAKE_TERMERR is set automatically in Make v4.1+, but macOS is still shipping
+# v3.81.
+MAKE_TERMERR ?= $(shell [[ -t 2 ]] && echo true)
 
 # This is how you get a literal space into a Makefile.
 space := $(eval) $(eval)
@@ -400,6 +327,57 @@ build/variables.mk: Makefile build/archive/contents/Makefile pkg/ui/Makefile bui
 # The following section handles building our C/C++ dependencies. These are
 # common because both the root Makefile and protobuf.mk have C dependencies.
 
+host-is-macos := $(findstring Darwin,$(UNAME))
+host-is-mingw := $(findstring MINGW,$(UNAME))
+
+ifdef host-is-macos
+# On macOS 10.11, XCode SDK v8.1 (and possibly others) indicate the presence of
+# symbols that don't exist until macOS 10.12. Setting MACOSX_DEPLOYMENT_TARGET
+# to the host machine's actual macOS version works around this. See:
+# https://github.com/jemalloc/jemalloc/issues/494.
+export MACOSX_DEPLOYMENT_TARGET ?= $(macos-version)
+endif
+
+# Cross-compilation occurs when you set TARGET_TRIPLE to something other than
+# HOST_TRIPLE. You'll need to ensure the cross-compiling toolchain is on your
+# path and override the rest of the variables that immediately follow as
+# necessary. For an example, see build/builder/cmd/mkrelease, which sets these
+# variables appropriately for the toolchains baked into the builder image.
+TARGET_TRIPLE := $(HOST_TRIPLE)
+XCMAKE_SYSTEM_NAME :=
+XGOOS :=
+XGOARCH :=
+XCC := $(TARGET_TRIPLE)-cc
+XCXX := $(TARGET_TRIPLE)-c++
+EXTRA_XCMAKE_FLAGS :=
+EXTRA_XCONFIGURE_FLAGS :=
+
+ifneq ($(HOST_TRIPLE),$(TARGET_TRIPLE))
+is-cross-compile := 1
+endif
+
+# CMAKE_TARGET_MESSAGES=OFF prevents CMake from printing progress messages
+# whenever a target is fully built to prevent spammy output from make when
+# c-deps are all already built. Progress messages are still printed when actual
+# compilation is being performed.
+cmake-flags := -DCMAKE_TARGET_MESSAGES=OFF $(if $(host-is-mingw),-G 'MSYS Makefiles')
+configure-flags :=
+
+# Use xcmake-flags when invoking CMake on libraries/binaries for the target
+# platform (i.e., the cross-compiled platform, if specified); use plain
+# cmake-flags when invoking CMake on libraries/binaries for the host platform.
+# Similarly for xconfigure-flags and configure-flags, and xgo and GO.
+xcmake-flags := $(cmake-flags) $(EXTRA_XCMAKE_FLAGS)
+xconfigure-flags := $(configure-flags) $(EXTRA_XCONFIGURE_FLAGS)
+xgo := $(GO)
+
+# If we're cross-compiling, inform Autotools and CMake.
+ifdef is-cross-compile
+xconfigure-flags += --host=$(TARGET_TRIPLE) CC=$(XCC) CXX=$(XCXX)
+xcmake-flags += -DCMAKE_SYSTEM_NAME=$(XCMAKE_SYSTEM_NAME) -DCMAKE_C_COMPILER=$(XCC) -DCMAKE_CXX_COMPILER=$(XCXX)
+xgo := GOOS=$(XGOOS) GOARCH=$(XGOARCH) CC=$(XCC) CXX=$(XCXX) $(xgo)
+endif
+
 C_DEPS_DIR := $(abspath c-deps)
 CRYPTOPP_SRC_DIR := $(C_DEPS_DIR)/cryptopp
 JEMALLOC_SRC_DIR := $(C_DEPS_DIR)/jemalloc
@@ -408,81 +386,30 @@ ROCKSDB_SRC_DIR  := $(C_DEPS_DIR)/rocksdb
 SNAPPY_SRC_DIR   := $(C_DEPS_DIR)/snappy
 LIBROACH_SRC_DIR := $(C_DEPS_DIR)/libroach
 
-CONFIGURE_FLAGS :=
-CMAKE_FLAGS := $(if $(MINGW),-G 'MSYS Makefiles')
+# Derived build variants.
+use-stdmalloc          := $(findstring stdmalloc,$(TAGS))
+use-msan               := $(findstring msan,$(GOFLAGS))
 
-# The following flag informs cmake to not print percent completes on target
-# completion, to prevent spammy output from make when c-deps are all already
-# built. Percent completion messages are still printed when actual compilation
-# is being performed.
-CMAKE_FLAGS += -DCMAKE_TARGET_MESSAGES=OFF
+# User-requested build variants.
+USE_ROCKSDB_ASSERTIONS :=
 
-# override so that no one is tempted to make USE_STDMALLOC=1 instead of make
-# TAGS=stdmalloc; without TAGS=stdmalloc, Go will still try to link jemalloc.
-override USE_STDMALLOC := $(findstring stdmalloc,$(TAGS))
-STDMALLOC_SUFFIX := $(if $(USE_STDMALLOC),_stdmalloc)
-
-ENABLE_ROCKSDB_ASSERTIONS := $(findstring race,$(TAGS))
-
-XCMAKE_FLAGS := $(CMAKE_FLAGS)
-
-ifdef XHOST_TRIPLE
-
-# Darwin wants clang, so special treatment is in order.
-ISDARWIN := $(findstring darwin,$(XHOST_TRIPLE))
-
-XHOST_BIN_DIR := /x-tools/$(XHOST_TRIPLE)/bin
-
-export PATH := $(XHOST_BIN_DIR):$(PATH)
-
-CC_PATH  := $(XHOST_BIN_DIR)/$(XHOST_TRIPLE)
-CXX_PATH := $(XHOST_BIN_DIR)/$(XHOST_TRIPLE)
-ifdef ISDARWIN
-CC_PATH  := $(CC_PATH)-clang
-CXX_PATH := $(CXX_PATH)-clang++
-else
-CC_PATH  := $(CC_PATH)-gcc
-CXX_PATH := $(CXX_PATH)-g++
-endif
-
-ifdef ISDARWIN
-CMAKE_SYSTEM_NAME := Darwin
-else ifneq ($(findstring linux,$(XHOST_TRIPLE)),)
-CMAKE_SYSTEM_NAME := Linux
-else ifneq ($(findstring mingw,$(XHOST_TRIPLE)),)
-CMAKE_SYSTEM_NAME := Windows
-endif
-
-CONFIGURE_FLAGS += --host=$(XHOST_TRIPLE) CC=$(CC_PATH) CXX=$(CXX_PATH)
-
-# Use XCMAKE_FLAGS when invoking CMake on libraries/binaries for the target
-# platform (i.e., the cross-compiled platform, if specified); use plain
-# CMAKE_FLAGS when invoking CMake on libraries/binaries for the host platform.
-XCMAKE_FLAGS += -DCMAKE_C_COMPILER=$(CC_PATH) -DCMAKE_CXX_COMPILER=$(CXX_PATH) -DCMAKE_SYSTEM_NAME=$(CMAKE_SYSTEM_NAME) -DCMAKE_INSTALL_NAME_TOOL=$(XHOST_TRIPLE)-install_name_tool
-
-TARGET_TRIPLE := $(XHOST_TRIPLE)
-else
-TARGET_TRIPLE := $(HOST_TRIPLE)
-endif
-
-NATIVE_SPECIFIER := $(TARGET_TRIPLE)$(NATIVE_SUFFIX)
-BUILD_DIR := $(GOPATH)/native/$(NATIVE_SPECIFIER)
+BUILD_DIR := $(GOPATH)/native/$(TARGET_TRIPLE)
 
 # In MinGW, cgo flags don't handle Unix-style paths, so convert our base path to
 # a Windows-style path.
 #
 # TODO(benesch): Figure out why. MinGW transparently converts Unix-style paths
 # everywhere else.
-ifdef MINGW
+ifdef host-is-mingw
 BUILD_DIR := $(shell cygpath -m $(BUILD_DIR))
 endif
 
-CRYPTOPP_DIR := $(BUILD_DIR)/cryptopp
-JEMALLOC_DIR := $(BUILD_DIR)/jemalloc
-PROTOBUF_DIR := $(BUILD_DIR)/protobuf
-ROCKSDB_DIR  := $(BUILD_DIR)/rocksdb$(STDMALLOC_SUFFIX)$(if $(ENABLE_ROCKSDB_ASSERTIONS),_assert)
-SNAPPY_DIR   := $(BUILD_DIR)/snappy
-LIBROACH_DIR := $(BUILD_DIR)/libroach
+CRYPTOPP_DIR := $(BUILD_DIR)/cryptopp$(if $(use-msan),_msan)
+JEMALLOC_DIR := $(BUILD_DIR)/jemalloc$(if $(use-msan),_msan)
+PROTOBUF_DIR := $(BUILD_DIR)/protobuf$(if $(use-msan),_msan)
+ROCKSDB_DIR  := $(BUILD_DIR)/rocksdb$(if $(use-msan),_msan)$(if $(use-stdmalloc),_stdmalloc)$(if $(USE_ROCKSDB_ASSERTIONS),_assert)
+SNAPPY_DIR   := $(BUILD_DIR)/snappy$(if $(use-msan),_msan)
+LIBROACH_DIR := $(BUILD_DIR)/libroach$(if $(use-msan),_msan)
 # Can't share with protobuf because protoc is always built for the host.
 PROTOC_DIR := $(GOPATH)/native/$(HOST_TRIPLE)/protobuf
 
@@ -495,36 +422,34 @@ LIBROACH    := $(LIBROACH_DIR)/libroach.a
 LIBROACHCCL := $(LIBROACH_DIR)/libroachccl.a
 PROTOC 		 := $(PROTOC_DIR)/protoc
 
-C_LIBS_COMMON = $(if $(USE_STDMALLOC),,$(LIBJEMALLOC)) $(LIBPROTOBUF) $(LIBSNAPPY) $(LIBROCKSDB)
+C_LIBS_COMMON = $(if $(use-stdmalloc),,$(LIBJEMALLOC)) $(LIBPROTOBUF) $(LIBSNAPPY) $(LIBROCKSDB)
 C_LIBS_OSS = $(C_LIBS_COMMON) $(LIBROACH)
 C_LIBS_CCL = $(C_LIBS_COMMON) $(LIBCRYPTOPP) $(LIBROACHCCL)
 
-# Go does not permit dashes in build tags. This is undocumented. Fun!
-NATIVE_SPECIFIER_TAG := $(subst -,_,$(NATIVE_SPECIFIER))$(STDMALLOC_SUFFIX)
+# Go does not permit dashes in build tags. This is undocumented.
+native-tag := $(subst -,_,$(TARGET_TRIPLE))$(if $(use-stdmalloc),_stdmalloc)$(if $(use-msan),_msan)
 
-# In each package that uses cgo, we inject include and library search paths
-# into files named zcgo_flags[_arch_vendor_os_abi].go. The logic for this is
-# complicated so that Make-driven builds can cache the state of builds for
-# multiple architectures at once, while still allowing the use of `go build`
-# and `go test` for the architecture most recently built with Make.
+# In each package that uses cgo, we inject include and library search paths into
+# files named zcgo_flags_{native-tag}.go. The logic for this is complicated so
+# that Make-driven builds can cache the state of builds for multiple
+# configurations at once, while still allowing the use of `go build` and `go
+# test` for the configuration most recently built with Make.
 #
-# Building with Make always adds the `make` and `arch_vendor_os_abi` tags to
-# the build.
+# Building with Make always adds the `make` and {native-tag} tags to the build.
 #
-# Unsuffixed flags files (zcgo_flags.cgo) have the build constraint `!make`
-# and are only compiled when invoking the Go toolchain directly on a package--
-# i.e., when the `make` build tag is not specified. These files are rebuilt
-# whenever the build signature changes (see build/defs.mk.sig), and so reflect
-# the target triple that Make was most recently invoked with.
+# Unsuffixed flags files (zcgo_flags.cgo) have the build constraint `!make` and
+# are only compiled when invoking the Go toolchain directly on a package-- i.e.,
+# when the `make` build tag is not specified. These files are rebuilt whenever
+# the build signature changes (see build/defs.mk.sig), and so reflect the target
+# triple that Make was most recently invoked with.
 #
-# Suffixed flags files (e.g. zcgo_flags_arch_vendor_os_abi.go) have the build
-# constraint `arch_vendor_os_abi` and are built the first time a Make-driven
-# build encounters a given `arch_vendor_os_abi` target triple. The Go
-# toolchain does not automatically set target-triple build tags, so these
-# files are only compiled when building with Make.
+# Suffixed flags files (e.g. zcgo_flags_{native-tag}.go) have the build
+# constraint `{native-tag}` and are built the first time a Make-driven build
+# encounters a given native tag. These tags are unset when building with the Go
+# toolchain directly, so these files are only compiled when building with Make.
 CGO_PKGS := cli server/status storage/engine ccl/storageccl/engineccl
 CGO_UNSUFFIXED_FLAGS_FILES := $(addprefix ./pkg/,$(addsuffix /zcgo_flags.go,$(CGO_PKGS)))
-CGO_SUFFIXED_FLAGS_FILES   := $(addprefix ./pkg/,$(addsuffix /zcgo_flags_$(NATIVE_SPECIFIER_TAG).go,$(CGO_PKGS)))
+CGO_SUFFIXED_FLAGS_FILES   := $(addprefix ./pkg/,$(addsuffix /zcgo_flags_$(native-tag).go,$(CGO_PKGS)))
 CGO_FLAGS_FILES := $(CGO_UNSUFFIXED_FLAGS_FILES) $(CGO_SUFFIXED_FLAGS_FILES)
 
 $(CGO_UNSUFFIXED_FLAGS_FILES): build/defs.mk.sig
@@ -532,7 +457,7 @@ $(CGO_UNSUFFIXED_FLAGS_FILES): build/defs.mk.sig
 $(CGO_FLAGS_FILES): Makefile
 	@echo '// GENERATED FILE DO NOT EDIT' > $@
 	@echo >> $@
-	@echo '// +build $(if $(findstring $(NATIVE_SPECIFIER_TAG),$@),$(NATIVE_SPECIFIER_TAG),!make)' >> $@
+	@echo '// +build $(if $(findstring $(native-tag),$@),$(native-tag),!make)' >> $@
 	@echo >> $@
 	@echo 'package $(notdir $(@D))' >> $@
 	@echo >> $@
@@ -569,7 +494,7 @@ $(CRYPTOPP_DIR)/Makefile: $(C_DEPS_DIR)/cryptopp-rebuild | bin/.submodules-initi
 	mkdir -p $(CRYPTOPP_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/cryptopp-rebuild. See above for rationale.
-	cd $(CRYPTOPP_DIR) && CFLAGS+=" $(AES_FLAGS)" && CXXFLAGS+=" $(AES_FLAGS)" cmake $(XCMAKE_FLAGS) $(CRYPTOPP_SRC_DIR) \
+	cd $(CRYPTOPP_DIR) && CFLAGS+=" $(AES_FLAGS)" && CXXFLAGS+=" $(AES_FLAGS)" cmake $(xcmake-flags) $(CRYPTOPP_SRC_DIR) \
 	  -DCMAKE_BUILD_TYPE=Release
 
 $(JEMALLOC_SRC_DIR)/configure.ac: | bin/.submodules-initialized
@@ -585,14 +510,14 @@ $(JEMALLOC_DIR)/Makefile: $(C_DEPS_DIR)/jemalloc-rebuild $(JEMALLOC_SRC_DIR)/con
 	@#
 	@# jemalloc profiling deadlocks when built against musl. See
 	@# https://github.com/jemalloc/jemalloc/issues/585.
-	cd $(JEMALLOC_DIR) && $(JEMALLOC_SRC_DIR)/configure $(CONFIGURE_FLAGS) $(if $(findstring musl,$(TARGET_TRIPLE)),,--enable-prof)
+	cd $(JEMALLOC_DIR) && $(JEMALLOC_SRC_DIR)/configure $(xconfigure-flags) $(if $(findstring musl,$(TARGET_TRIPLE)),,--enable-prof)
 
 $(PROTOBUF_DIR)/Makefile: $(C_DEPS_DIR)/protobuf-rebuild | bin/.submodules-initialized
 	rm -rf $(PROTOBUF_DIR)
 	mkdir -p $(PROTOBUF_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/protobuf-rebuild. See above for rationale.
-	cd $(PROTOBUF_DIR) && cmake $(XCMAKE_FLAGS) -Dprotobuf_BUILD_TESTS=OFF $(PROTOBUF_SRC_DIR)/cmake \
+	cd $(PROTOBUF_DIR) && cmake $(xcmake-flags) -Dprotobuf_BUILD_TESTS=OFF $(PROTOBUF_SRC_DIR)/cmake \
 	  -DCMAKE_BUILD_TYPE=Release
 
 ifneq ($(PROTOC_DIR),$(PROTOBUF_DIR))
@@ -606,15 +531,15 @@ $(PROTOC_DIR)/Makefile: $(C_DEPS_DIR)/protobuf-rebuild | bin/.submodules-initial
 endif
 
 $(ROCKSDB_DIR)/Makefile: sse := $(if $(findstring x86_64,$(TARGET_TRIPLE)),-msse3)
-$(ROCKSDB_DIR)/Makefile: $(C_DEPS_DIR)/rocksdb-rebuild | bin/.submodules-initialized $(LIBSNAPPY) $(if $(USE_STDMALLOC),,$(LIBJEMALLOC))
+$(ROCKSDB_DIR)/Makefile: $(C_DEPS_DIR)/rocksdb-rebuild | bin/.submodules-initialized $(LIBSNAPPY) $(if $(use-stdmalloc),,$(LIBJEMALLOC))
 	rm -rf $(ROCKSDB_DIR)
 	mkdir -p $(ROCKSDB_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/rocksdb-rebuild. See above for rationale.
-	cd $(ROCKSDB_DIR) && CFLAGS+=" $(sse)" && CXXFLAGS+=" $(sse)" && cmake $(XCMAKE_FLAGS) $(ROCKSDB_SRC_DIR) \
-	  $(if $(findstring release,$(BUILD_TYPE)),-DPORTABLE=ON) -DWITH_GFLAGS=OFF \
+	cd $(ROCKSDB_DIR) && CFLAGS+=" $(sse)" && CXXFLAGS+=" $(sse)" && cmake $(xcmake-flags) $(ROCKSDB_SRC_DIR) \
+	  $(if $(findstring release,$(BUILDTYPE)),-DPORTABLE=ON) -DWITH_GFLAGS=OFF \
 	  -DSNAPPY_LIBRARIES=$(LIBSNAPPY) -DSNAPPY_INCLUDE_DIR="$(SNAPPY_SRC_DIR);$(SNAPPY_DIR)" -DWITH_SNAPPY=ON \
-	  $(if $(USE_STDMALLOC),,-DJEMALLOC_LIBRARIES=$(LIBJEMALLOC) -DJEMALLOC_INCLUDE_DIR=$(JEMALLOC_DIR)/include -DWITH_JEMALLOC=ON) \
+	  $(if $(use-stdmalloc),,-DJEMALLOC_LIBRARIES=$(LIBJEMALLOC) -DJEMALLOC_INCLUDE_DIR=$(JEMALLOC_DIR)/include -DWITH_JEMALLOC=ON) \
 	  -DCMAKE_BUILD_TYPE=$(if $(ENABLE_ROCKSDB_ASSERTIONS),Debug,Release)
 
 $(SNAPPY_DIR)/Makefile: $(C_DEPS_DIR)/snappy-rebuild | bin/.submodules-initialized
@@ -622,7 +547,7 @@ $(SNAPPY_DIR)/Makefile: $(C_DEPS_DIR)/snappy-rebuild | bin/.submodules-initializ
 	mkdir -p $(SNAPPY_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/snappy-rebuild. See above for rationale.
-	cd $(SNAPPY_DIR) && cmake $(XCMAKE_FLAGS) $(SNAPPY_SRC_DIR) \
+	cd $(SNAPPY_DIR) && cmake $(xcmake-flags) $(SNAPPY_SRC_DIR) \
 	  -DCMAKE_BUILD_TYPE=Release
 
 # TODO(benesch): make it possible to build libroach without CCL code. Because
@@ -633,7 +558,7 @@ $(LIBROACH_DIR)/Makefile: $(C_DEPS_DIR)/libroach-rebuild | bin/.submodules-initi
 	mkdir -p $(LIBROACH_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/libroach-rebuild. See above for rationale.
-	cd $(LIBROACH_DIR) && cmake $(XCMAKE_FLAGS) $(LIBROACH_SRC_DIR) -DCMAKE_BUILD_TYPE=Release \
+	cd $(LIBROACH_DIR) && cmake $(xcmake-flags) $(LIBROACH_SRC_DIR) -DCMAKE_BUILD_TYPE=Release \
 		-DPROTOBUF_LIB=$(LIBPROTOBUF) -DROCKSDB_LIB=$(LIBROCKSDB) \
 		-DJEMALLOC_LIB=$(LIBJEMALLOC) -DSNAPPY_LIB=$(LIBSNAPPY) \
 		-DCRYPTOPP_LIB=$(LIBCRYPTOPP)
@@ -710,13 +635,11 @@ check-libroach: $(LIBROACH_DIR)/Makefile $(LIBJEMALLOC) $(LIBPROTOBUF) $(LIBSNAP
 	@$(MAKE) --no-print-directory -C $(LIBROACH_DIR)
 	cd $(LIBROACH_DIR) && ctest -V -R $(TESTS)
 
-override TAGS += make $(NATIVE_SPECIFIER_TAG)
+override TAGS += make $(native-tag)
 
 # Some targets (protobuf) produce different results depending on the sort order;
 # set LC_ALL so this is consistent across systems.
 export LC_ALL=C
-
-XGO := $(strip $(if $(XGOOS),GOOS=$(XGOOS)) $(if $(XGOARCH),GOARCH=$(XGOARCH)) $(if $(XHOST_TRIPLE),CC=$(CC_PATH) CXX=$(CXX_PATH)) $(GO))
 
 # defs.mk stores cached values of shell commands to avoid recomputing them on
 # every Make invocation. This has a small but noticeable effect, especially on
@@ -726,7 +649,7 @@ ifndef IGNORE_GOVERS
 	@build/go-version-check.sh $(GO) || { echo "Disable this check with IGNORE_GOVERS=1." >&2; exit 1; }
 endif
 	@echo "macos-version = $$(sw_vers -productVersion 2>/dev/null | grep -oE '[0-9]+\.[0-9]+')" > $@
-	@echo "GOEXE = $$($(XGO) env GOEXE)" >> $@
+	@echo "GOEXE = $$($(xgo) env GOEXE)" >> $@
 	@echo "NCPUS = $$({ getconf _NPROCESSORS_ONLN || sysctl -n hw.ncpu || nproc; } 2>/dev/null)" >> $@
 	@echo "UNAME = $$(uname)" >> $@
 	@echo "HOST_TRIPLE = $$($$($(GO) env CC) -dumpmachine)" >> $@
@@ -740,11 +663,13 @@ endif
 # Go binary. It is not intended to be perfect. Upgrading the compiler toolchain
 # in place will go unnoticed, for example. Similar problems exist in all Make-
 # based build systems and are not worth solving.
-build/defs.mk.sig: sig = $(PATH):$(CURDIR):$(XGO):$(GOPATH):$(CC):$(CXX):$(TYPE):$(IGNORE_GOVERS)
+build/defs.mk.sig: sig = $(PATH):$(CURDIR):$(GO):$(GOPATH):$(CC):$(CXX):$(TARGET_TRIPLE):$(BUILDTYPE):$(IGNORE_GOVERS)
 build/defs.mk.sig: .ALWAYS_REBUILD
 	@echo '$(sig)' | cmp -s - $@ || echo '$(sig)' > $@
 
-COCKROACH := ./cockroach$(SUFFIX)$(GOEXE)
+COCKROACH      := ./cockroach$(SUFFIX)
+COCKROACHOSS   := ./cockroachoss$(SUFFIX)
+COCKROACHSHORT := ./cockroachshort$(SUFFIX)
 
 SQLPARSER_TARGETS = \
 	pkg/sql/parser/sql.go \
@@ -767,14 +692,14 @@ OPTGEN_TARGETS = \
 	pkg/sql/opt/rule_name_string.go
 
 go-targets-ccl := \
-	$(COCKROACH) build buildshort go-install \
+	$(COCKROACH) $(COCKROACHSHORT) go-install \
 	bench benchshort \
 	check test testshort testslow testrace testraceslow testbuild \
 	stress stressrace \
 	generate \
 	lint lintshort
 
-go-targets := $(go-targets-ccl) buildoss
+go-targets := $(go-targets-ccl) $(COCKROACHOSS)
 
 .DEFAULT_GOAL := all
 all: build
@@ -782,14 +707,20 @@ all: build
 .PHONY: c-deps
 c-deps: $(C_LIBS_CCL)
 
-$(COCKROACH) build buildoss buildshort: BUILDMODE = build -o $(COCKROACH)
+build-mode = build -o $(build-output)
 
-$(COCKROACH) build go-install generate: pkg/ui/distccl/bindata.go
+go-install: build-mode = install
 
-buildoss: BUILDTARGET = ./pkg/cmd/cockroach-oss
-buildoss: $(C_LIBS_OSS) pkg/ui/distoss/bindata.go
+$(COCKROACH): build-output = $(COCKROACH)
+$(COCKROACHOSS): build-output = $(COCKROACHOSS)
+$(COCKROACHSHORT): build-output = $(COCKROACHSHORT)
 
-buildshort: BUILDTARGET = ./pkg/cmd/cockroach-short
+$(COCKROACH) go-install generate: pkg/ui/distccl/bindata.go
+
+$(COCKROACHOSS): BUILDTARGET = ./pkg/cmd/cockroach-oss
+$(COCKROACHOSS): $(C_LIBS_OSS) pkg/ui/distoss/bindata.go
+
+$(COCKROACHSHORT): BUILDTARGET = ./pkg/cmd/cockroach-short
 
 $(go-targets-ccl): $(C_LIBS_CCL)
 
@@ -808,7 +739,7 @@ $(go-targets): override LINKFLAGS += \
 # The build.utcTime format must remain in sync with TimeFormat in
 # pkg/build/info.go. It is not installed in tests to avoid busting the cache on
 # every rebuild.
-$(COCKROACH) build buildoss buildshort go-install: override LINKFLAGS += \
+$(COCKROACH) $(COCKROACHOSS) $(COCKROACHSHORT) go-install: override LINKFLAGS += \
 	-X "github.com/cockroachdb/cockroach/pkg/build.utcTime=$(shell date -u '+%Y/%m/%d %H:%M:%S')"
 
 SETTINGS_DOC_PAGE := docs/generated/settings/settings.html
@@ -817,11 +748,9 @@ SETTINGS_DOC_PAGE := docs/generated/settings/settings.html
 # from the linker aren't suppressed. The usage of `-v` also shows when
 # dependencies are rebuilt which is useful when switching between
 # normal and race test builds.
-.PHONY: build buildoss buildshort go-install
-build: ## Build the CockroachDB binary.
-buildoss: ## Build the CockroachDB binary without any CCL-licensed code.
-$(COCKROACH) go-install:
-	 $(XGO) $(BUILDMODE) -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(BUILDTARGET)
+.PHONY: go-install
+$(COCKROACH) $(COCKROACHOSS) $(COCKROACHSHORT) go-install:
+	 $(xgo) $(build-mode) -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(BUILDTARGET)
 
 # The build targets, in addition to producing a Cockroach binary, silently
 # regenerate SQL diagram BNFs and some other doc pages. Generating these docs
@@ -836,7 +765,19 @@ $(COCKROACH) go-install:
 # diagrams. When the generated files are not checked in, the breakage goes
 # unnoticed until the docs team comes along, potentially months later. Much
 # better to make the developer who introduces the breakage fix the breakage.
-build buildoss buildshort: $(COCKROACH) $(DOCGEN_TARGETS) $(if $(XHOST_TRIPLE),,$(SETTINGS_DOC_PAGE))
+.PHONY: build buildoss buildshort
+build: ## Build the CockroachDB binary.
+buildoss: ## Build the CockroachDB binary without any CCL-licensed code.
+buildshort: ## Build the CockroachDB binary without the admin UI.
+build: $(COCKROACH)
+buildoss: $(COCKROACHOSS)
+buildshort: $(COCKROACHSHORT)
+build buildoss buildshort: $(DOCGEN_TARGETS) $(if $(is-cross-compile),,$(SETTINGS_DOC_PAGE))
+
+# For historical reasons, symlink cockroach to cockroachshort.
+# TODO(benesch): see if it would break anyone's workflow to remove this.
+buildshort:
+	ln -sf $(COCKROACHSHORT) $(COCKROACH)
 
 .PHONY: install
 install: ## Install the CockroachDB binary.
@@ -853,16 +794,16 @@ start:
 # PKG is expanded and all packages are built and moved to their directory.
 .PHONY: testbuild
 testbuild:
-	$(XGO) list -tags '$(TAGS)' -f \
-	'$(XGO) test -v $(GOFLAGS) -tags '\''$(TAGS)'\'' -ldflags '\''$(LINKFLAGS)'\'' -c {{.ImportPath}} -o {{.Dir}}/{{.Name}}.test' $(PKG) | \
+	$(xgo) list -tags '$(TAGS)' -f \
+	'$(xgo) test -v $(GOFLAGS) -tags '\''$(TAGS)'\'' -ldflags '\''$(LINKFLAGS)'\'' -c {{.ImportPath}} -o {{.Dir}}/{{.Name}}.test' $(PKG) | \
 	$(SHELL)
 
 testshort: override TESTFLAGS += -short
 
 testrace: ## Run tests with the Go race detector enabled.
-testrace: override GOFLAGS += -race
-testrace: export GORACE := halt_on_error=1
-testrace: TESTTIMEOUT := $(RACETIMEOUT)
+testrace stressrace: override GOFLAGS += -race
+testrace stressrace: export GORACE := halt_on_error=1
+testrace stressrace: TESTTIMEOUT := $(RACETIMEOUT)
 
 # Directory scans in the builder image are excruciatingly slow when running
 # Docker for Mac, so we filter out the 20k+ UI dependencies that are
@@ -878,18 +819,16 @@ bench: TESTTIMEOUT := $(BENCHTIMEOUT)
 # that longer running benchmarks can skip themselves.
 benchshort: override TESTFLAGS += -benchtime=1ns -short
 
-stress: ## Run tests under stress.
-stress stressrace: override GOFLAGS += -exec 'stress $(STRESSFLAGS)'
-stress stressrace: override TESTFLAGS += -v # necessary for interactive output from `stress`
-
-stressrace: ## Run tests under stress with the race detector enabled.
-stressrace: override GOFLAGS += -race
-stressrace: TESTTIMEOUT := $(RACETIMEOUT)
-
 .PHONY: check test testshort testrace testlogic testccllogic bench benchshort
 test: ## Run tests.
-check test testshort testrace bench benchshort stress stressrace:
-	$(XGO) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS)
+check test testshort testrace bench benchshort:
+	$(xgo) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS)
+
+.PHONY: stress stressrace
+stress: ## Run tests under stress.
+stressrace: ## Run tests under stress with the race detector enabled.
+stress stressrace:
+	$(xgo) test $(GOFLAGS) -exec 'stress $(STRESSFLAGS)' -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" -timeout 0 $(PKG) $(filter-out -v,$(TESTFLAGS)) -v -args -test.timeout $(TESTTIMEOUT)
 
 testlogic: ## Run SQL Logic Tests.
 testlogic: bin/logictest
@@ -908,7 +847,7 @@ testraceslow: TESTTIMEOUT := $(RACETIMEOUT)
 .PHONY: testslow testraceslow
 testslow testraceslow: override TESTFLAGS += -v
 testslow testraceslow:
-	$(XGO) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS) | grep -F ': Test' | sed -E 's/(--- PASS: |\(|\))//g' | awk '{ print $$2, $$1 }' | sort -rn | head -n 10
+	$(xgo) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS) | grep -F ': Test' | sed -E 's/(--- PASS: |\(|\))//g' | awk '{ print $$2, $$1 }' | sort -rn | head -n 10
 
 .PHONY: upload-coverage
 upload-coverage: bin/.bootstrap
@@ -948,13 +887,13 @@ lint: bin/returncheck
 	@# Run 'go build -i' to ensure we have compiled object files available for all
 	@# packages. In Go 1.10, only 'go vet' recompiles on demand. For details:
 	@# https://groups.google.com/forum/#!msg/golang-dev/qfa3mHN4ZPA/X2UzjNV1BAAJ.
-	$(XGO) build -i -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
-	$(XGO) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run 'TestLint/$(TESTS)'
+	$(xgo) build -i -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
+	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run 'TestLint/$(TESTS)'
 
 .PHONY: lintshort
 lintshort: override TAGS += lint
 lintshort: ## Run a fast subset of the style checkers and linters.
-	$(XGO) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -run 'TestLint/$(TESTS)'
+	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -run 'TestLint/$(TESTS)'
 
 .PHONY: protobuf
 protobuf: $(PROTOBUF_TARGETS)
@@ -1130,7 +1069,7 @@ STYLINT            := ./node_modules/.bin/stylint
 TSLINT             := ./node_modules/.bin/tslint
 TSC                := ./node_modules/.bin/tsc
 KARMA              := ./node_modules/.bin/karma
-WEBPACK            := ./node_modules/.bin/webpack
+WEBPACK            := ./node_modules/.bin/webpack $(if $(MAKE_TERMERR),--progress)
 WEBPACK_DEV_SERVER := ./node_modules/.bin/webpack-dev-server
 WEBPACK_DASHBOARD  := ./opt/node_modules/.bin/webpack-dashboard
 
@@ -1183,9 +1122,13 @@ ui-test: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS)
 ui-test-watch: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS)
 	$(NODE_RUN) -C pkg/ui $(KARMA) start --no-single-run --auto-watch
 
+.PHONY: ui-test-debug
+ui-test-debug: $(UI_DLLS) $(UI_MANIFESTS)
+	$(NODE_RUN) -C $(UI_ROOT) $(KARMA) start --browsers Chrome --no-single-run --debug --auto-watch
+
 pkg/ui/distccl/bindata.go: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS) $(UI_JS_CCL) $(shell find pkg/ui/ccl -type f)
 pkg/ui/distoss/bindata.go: $(UI_OSS_DLLS) $(UI_OSS_MANIFESTS) $(UI_JS_OSS)
-pkg/ui/dist%/bindata.go: pkg/ui/webpack.app.js $(shell find pkg/ui/src pkg/ui/styl -type f)
+pkg/ui/dist%/bindata.go: pkg/ui/webpack.app.js $(shell find pkg/ui/src pkg/ui/styl -type f) | bin/.bootstrap
 	find pkg/ui/dist$* -mindepth 1 -not -name dist$*.go -delete
 	set -e; shopt -s extglob; for dll in $(notdir $(filter %.dll.js,$^)); do \
 	  ln -s ../dist/$$dll pkg/ui/dist$*/$${dll/@(.ccl|.oss)}; \
@@ -1317,9 +1260,9 @@ bin/.docgen_functions: bin/docgen
 	docgen functions docs/generated/sql --quiet
 	touch $@
 
-$(SETTINGS_DOC_PAGE): $(COCKROACH)
-	 @$(COCKROACH) gen settings-list --format=html > $(SETTINGS_DOC_PAGE).tmp
-	 @mv -f $(SETTINGS_DOC_PAGE).tmp $(SETTINGS_DOC_PAGE)
+$(SETTINGS_DOC_PAGE): $(build-output)
+	 @$(build-output) gen settings-list --format=html > $@.tmp
+	 @mv -f $@.tmp $@
 
 optgen-defs := pkg/sql/opt/ops/*.opt
 optgen-norm-rules := pkg/sql/opt/norm/rules/*.opt
@@ -1436,7 +1379,7 @@ $(testbins): bin/%: bin/%.d | bin/prereqs $(SUBMODULES_TARGET)
 	@echo go test -c $($*-package)
 	bin/prereqs -test $($*-package) > $@.d.tmp
 	mv -f $@.d.tmp $@.d
-	$(XGO) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -c -o $@ $($*-package)
+	$(xgo) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -c -o $@ $($*-package)
 
 bin/prereqs: ./pkg/cmd/prereqs/*.go
 	@echo go install -v ./pkg/cmd/prereqs

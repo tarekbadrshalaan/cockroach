@@ -71,23 +71,20 @@ func (b *Builder) buildTable(texpr tree.TableExpr, inScope *scope) (outScope *sc
 
 			panic(builderError{err})
 		}
-
-		// TODO(andyk): Re-enable virtual tables when we can fully support them.
-		if tab.IsVirtualTable() {
-			panic(unimplementedf("virtual tables are not supported"))
-		}
-
 		return b.buildScan(tab, tn, inScope)
 
 	case *tree.ParenTableExpr:
 		return b.buildTable(source.Expr, inScope)
 
+	case *tree.RowsFromExpr:
+		return b.buildZip(source.Items, inScope)
+
 	case *tree.Subquery:
 		outScope = b.buildStmt(source.Select, inScope)
 
 		// Treat the subquery result as an anonymous data source (i.e. column names
-		// are not qualified). Remove any hidden columns added by the subquery's
-		// ORDER BY clause.
+		// are not qualified). Remove hidden columns, as they are not accessible
+		// outside the subquery.
 		outScope.setTableAlias("")
 		outScope.removeHiddenCols()
 
@@ -108,8 +105,20 @@ func (b *Builder) renameSource(as tree.AliasClause, scope *scope) {
 	colAlias := as.Cols
 
 	if as.Alias != "" {
-		// TODO(rytaft): Handle anonymous tables such as set-generating
-		// functions with just one column.
+		// Special case for Postgres compatibility: if a data source does not
+		// currently have a name, and it is a set-generating function or a scalar
+		// function with just one column, and the AS clause doesn't specify column
+		// names, then use the specified table name both as the column name and
+		// table name.
+		noColNameSpecified := len(colAlias) == 0
+		if scope.isAnonymousTable() && noColNameSpecified {
+			// SRFs and scalar functions used as a data source are always wrapped in
+			// a Zip operation.
+			ev := memo.MakeNormExprView(b.factory.Memo(), scope.group)
+			if ev.Operator() == opt.ZipOp && ev.Logical().Relational.OutputCols.Len() == 1 {
+				colAlias = tree.NameList{as.Alias}
+			}
+		}
 
 		// If an alias was specified, use that to qualify the column names.
 		tableAlias = tree.MakeUnqualifiedTableName(as.Alias)
@@ -136,16 +145,16 @@ func (b *Builder) renameSource(as tree.AliasClause, scope *scope) {
 	}
 }
 
-// buildScan builds a memo group for a scanOp expression on the given table
-// with the given table name.
+// buildScan builds a memo group for a ScanOp or VirtualScanOp expression on the
+// given table with the given table name.
 //
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
 func (b *Builder) buildScan(tab opt.Table, tn *tree.TableName, inScope *scope) (outScope *scope) {
 	tabName := tree.AsStringWithFlags(tn, b.FmtFlags)
 	tabID := b.factory.Metadata().AddTableWithName(tab, tabName)
-	scanOpDef := memo.ScanOpDef{Table: tabID}
 
+	var tabCols opt.ColSet
 	outScope = inScope.push()
 	for i := 0; i < tab.ColumnCount(); i++ {
 		col := tab.Column(i)
@@ -160,12 +169,18 @@ func (b *Builder) buildScan(tab opt.Table, tn *tree.TableName, inScope *scope) (
 			hidden:   col.IsHidden(),
 		}
 
-		scanOpDef.Cols.Add(int(colID))
+		tabCols.Add(int(colID))
 		b.colMap = append(b.colMap, colProps)
 		outScope.cols = append(outScope.cols, colProps)
 	}
 
-	outScope.group = b.factory.ConstructScan(b.factory.InternScanOpDef(&scanOpDef))
+	if tab.IsVirtualTable() {
+		def := memo.VirtualScanOpDef{Table: tabID, Cols: tabCols}
+		outScope.group = b.factory.ConstructVirtualScan(b.factory.InternVirtualScanOpDef(&def))
+	} else {
+		def := memo.ScanOpDef{Table: tabID, Cols: tabCols}
+		outScope.group = b.factory.ConstructScan(b.factory.InternScanOpDef(&def))
+	}
 	return outScope
 }
 
@@ -335,7 +350,9 @@ func (b *Builder) buildFrom(from *tree.From, where *tree.Where, inScope *scope) 
 	if outScope == nil {
 		// TODO(peter): This should be a table with 1 row and 0 columns to match
 		// current cockroach behavior.
-		rows := []memo.GroupID{b.factory.ConstructTuple(b.factory.InternList(nil))}
+		rows := []memo.GroupID{b.factory.ConstructTuple(
+			b.factory.InternList(nil), b.factory.InternType(memo.EmptyTupleType),
+		)}
 		outScope = inScope.push()
 		outScope.group = b.factory.ConstructValues(
 			b.factory.InternList(rows),

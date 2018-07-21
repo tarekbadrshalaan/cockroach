@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 )
 
 // checkExpr does sanity checking on an Expr. This code is called from
@@ -26,18 +27,7 @@ import (
 // this code in regular builds).
 func (f *Factory) checkExpr(ev memo.ExprView) {
 	// Check logical properties.
-	relational := ev.Logical().Relational
-	if relational != nil {
-		if !relational.NotNullCols.SubsetOf(relational.OutputCols) {
-			panic(fmt.Sprintf("not null cols %s not a subset of output cols %s",
-				relational.NotNullCols, relational.OutputCols))
-		}
-		if relational.OuterCols.Intersects(relational.OutputCols) {
-			panic(fmt.Sprintf("outer cols %s intersect output cols %s",
-				relational.OuterCols, relational.OutputCols))
-		}
-		relational.FuncDeps.Verify()
-	}
+	ev.Logical().Verify()
 
 	switch ev.Operator() {
 	case opt.ProjectionsOp:
@@ -69,6 +59,20 @@ func (f *Factory) checkExpr(ev memo.ExprView) {
 					panic("aggregation contains bare variable")
 				}
 			}
+		}
+
+	case opt.LimitOp, opt.OffsetOp, opt.RowNumberOp, opt.GroupByOp, opt.ScalarGroupByOp:
+		var ordering *props.OrderingChoice
+		switch ev.Operator() {
+		case opt.LimitOp, opt.OffsetOp:
+			ordering = ev.Private().(*props.OrderingChoice)
+		case opt.RowNumberOp:
+			ordering = &ev.Private().(*memo.RowNumberDef).Ordering
+		case opt.GroupByOp, opt.ScalarGroupByOp:
+			ordering = &ev.Private().(*memo.GroupByDef).Ordering
+		}
+		if outCols := ev.Child(0).Logical().Relational.OutputCols; !ordering.SubsetOfCols(outCols) {
+			panic(fmt.Sprintf("invalid ordering %v (op: %s, outcols: %v)", ordering, ev.Operator(), outCols))
 		}
 	}
 }

@@ -113,6 +113,7 @@ define Placeholder {
 [Scalar]
 define Tuple {
     Elems ExprList
+    Typ   Type
 }
 
 # Projections is a set of typed scalar expressions that will become output
@@ -512,6 +513,15 @@ define Function {
 [Scalar]
 define Coalesce {
     Args ExprList
+}
+
+# ColumnAccess is a scalar expression that returns a column from the given
+# input expression (which is assumed to be of type Tuple). Idx is the ordinal
+# index of the column in Input.
+[Scalar]
+define ColumnAccess {
+    Input Expr
+    Idx   TupleOrdinal
 }
 
 # UnsupportedExpr is used for interfacing with the old planner code. It can

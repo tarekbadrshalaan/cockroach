@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
@@ -74,7 +75,7 @@ type DistSQLVersion uint32
 //
 // ATTENTION: When updating these fields, add to version_history.txt explaining
 // what changed.
-const Version DistSQLVersion = 15
+const Version DistSQLVersion = 17
 
 // MinAcceptedVersion is the oldest version that the server is
 // compatible with; see above.
@@ -179,7 +180,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) *ServerImpl {
 		ServerConfig:  cfg,
 		regexpCache:   tree.NewRegexpCache(512),
 		flowRegistry:  makeFlowRegistry(cfg.NodeID.Get()),
-		flowScheduler: newFlowScheduler(cfg.AmbientContext, cfg.Stopper, cfg.Metrics),
+		flowScheduler: newFlowScheduler(cfg.AmbientContext, cfg.Stopper, cfg.Settings, cfg.Metrics),
 		memMonitor: mon.MakeMonitor(
 			"distsql",
 			mon.MemoryResource,
@@ -317,11 +318,18 @@ func (ds *ServerImpl) setupFlow(
 	monitor.Start(ctx, parentMonitor, mon.BoundAccount{})
 	acc := monitor.MakeBoundAccount()
 
+	if txn := req.DeprecatedTxn; txn != nil {
+		if req.TxnCoordMeta != nil {
+			return nil, nil, errors.Errorf("provided both Txn and TxnCoordMeta")
+		}
+		meta := roachpb.MakeTxnCoordMeta(*txn)
+		req.TxnCoordMeta = &meta
+	}
 	var txn *client.Txn
-	if req.Txn != nil {
+	if meta := req.TxnCoordMeta; meta != nil {
 		// The flow will run in a Txn that specifies child=true because we
 		// do not want each distributed Txn to heartbeat the transaction.
-		txn = client.NewTxnWithProto(ds.FlowDB, req.Flow.Gateway, client.LeafTxn, *req.Txn)
+		txn = client.NewTxnWithCoordMeta(ds.FlowDB, req.Flow.Gateway, client.LeafTxn, *meta)
 	}
 
 	location, err := timeutil.TimeZoneStringToLocation(req.EvalContext.Location)
@@ -375,6 +383,7 @@ func (ds *ServerImpl) setupFlow(
 		id:             req.Flow.FlowID,
 		EvalCtx:        evalCtx,
 		rpcCtx:         ds.RPCContext,
+		nodeDialer:     nodedialer.New(ds.RPCContext, gossip.AddressResolver(ds.Gossip)),
 		gossip:         ds.Gossip,
 		txn:            txn,
 		clientDB:       ds.DB,
@@ -384,6 +393,7 @@ func (ds *ServerImpl) setupFlow(
 		TempStorage:    ds.TempStorage,
 		diskMonitor:    ds.DiskMonitor,
 		JobRegistry:    ds.ServerConfig.JobRegistry,
+		traceKV:        req.TraceKV,
 	}
 
 	ctx = flowCtx.AnnotateCtx(ctx)
@@ -487,7 +497,8 @@ func (ds *ServerImpl) flowStreamInt(ctx context.Context, stream DistSQL_FlowStre
 		log.Infof(ctx, "connecting inbound stream %s/%d", flowID.Short(), streamID)
 	}
 	f, receiver, cleanup, err := ds.flowRegistry.ConnectInboundStream(
-		ctx, flowID, streamID, stream, flowStreamDefaultTimeout)
+		ctx, flowID, streamID, stream, settingFlowStreamTimeout.Get(&ds.Settings.SV),
+	)
 	if err != nil {
 		return err
 	}
@@ -538,10 +549,9 @@ type TestingKnobs struct {
 	// checked by a test receiver on the gateway.
 	MetadataTestLevel MetadataTestLevel
 
-	// OverrideStallTime instructs processors to report a stall time of 0s in
-	// reported execution statistics. This is used so that EXPLAIN ANALYZE plans
-	// stay the same across runs.
-	OverrideStallTime bool
+	// DeterministicStats overrides stats which don't have reliable values, like
+	// stall time and bytes sent. It replaces them with a zero value.
+	DeterministicStats bool
 }
 
 // MetadataTestLevel represents the types of queries where metadata test

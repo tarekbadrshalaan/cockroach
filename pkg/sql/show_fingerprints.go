@@ -82,7 +82,7 @@ func (p *planner) ShowFingerprints(
 }
 
 var showFingerprintsColumns = sqlbase.ResultColumns{
-	{Name: "index", Typ: types.String},
+	{Name: "index_name", Typ: types.String},
 	{Name: "fingerprint", Typ: types.String},
 }
 
@@ -155,8 +155,7 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	// like the outter one.
 	if params.p.asOfSystemTime {
 		ts := params.p.txn.OrigTimestamp()
-		tsStr := fmt.Sprintf("%d.%d", ts.WallTime, ts.Logical)
-		sql = sql + " AS OF SYSTEM TIME " + tsStr
+		sql = sql + " AS OF SYSTEM TIME " + ts.AsOfSystemTime()
 	}
 
 	fingerprintCols, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRow(

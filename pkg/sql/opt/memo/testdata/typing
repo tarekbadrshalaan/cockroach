@@ -41,7 +41,7 @@ SELECT 1 AS a, TRUE AS b, FALSE AS c, NULL AS d
 project
  ├── columns: a:1(int!null) b:2(bool!null) c:3(bool!null) d:4(unknown)
  ├── values
- │    └── tuple [type=tuple{}]
+ │    └── tuple [type=tuple]
  └── projections
       ├── const: 1 [type=int]
       ├── true [type=bool]
@@ -285,7 +285,7 @@ SELECT length('text')
 project
  ├── columns: length:1(int)
  ├── values
- │    └── tuple [type=tuple{}]
+ │    └── tuple [type=tuple]
  └── projections
       └── length('text') [type=int]
 
@@ -296,7 +296,7 @@ SELECT div(1.0, 2.0)
 project
  ├── columns: div:1(decimal)
  ├── values
- │    └── tuple [type=tuple{}]
+ │    └── tuple [type=tuple]
  └── projections
       └── div(1.0, 2.0) [type=decimal]
 
@@ -313,7 +313,7 @@ SELECT greatest(1, 2, 3, 4)
 project
  ├── columns: greatest:1(int)
  ├── values
- │    └── tuple [type=tuple{}]
+ │    └── tuple [type=tuple]
  └── projections
       └── greatest(1, 2, 3, 4) [type=int]
 
@@ -325,7 +325,7 @@ SELECT
     stddev(z), xor_agg(x::int), json_agg(x::json), jsonb_agg(x::jsonb)
 FROM b
 ----
-group-by
+scalar-group-by
  ├── columns: array_agg:3(decimal[]) avg:4(decimal) bool_and:6(bool) bool_or:7(bool) concat_agg:8(string) count:9(int) count:10(int) max:11(string) max:12(decimal) sum_int:14(int) sum:15(decimal) sqrdiff:16(decimal) variance:17(decimal) stddev:18(decimal) xor_agg:19(int) json_agg:21(jsonb) jsonb_agg:23(jsonb)
  ├── project
  │    ├── columns: column5:5(bool) column13:13(int) column20:20(jsonb) column22:22(jsonb) x:1(string!null) z:2(decimal!null)
@@ -382,8 +382,8 @@ project
  │    ├── group-by
  │    │    ├── columns: a.x:1(int!null) y:2(int) max:6(string)
  │    │    ├── grouping columns: a.x:1(int!null)
- │    │    ├── left-join
- │    │    │    ├── columns: a.x:1(int!null) y:2(int) b.x:4(string) z:5(decimal)
+ │    │    ├── inner-join
+ │    │    │    ├── columns: a.x:1(int!null) y:2(int!null) b.x:4(string!null) z:5(decimal!null)
  │    │    │    ├── scan a
  │    │    │    │    └── columns: a.x:1(int!null) y:2(int)
  │    │    │    ├── scan b

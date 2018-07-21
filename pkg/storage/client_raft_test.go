@@ -31,9 +31,11 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
@@ -2585,9 +2587,9 @@ func TestReplicaGCRace(t *testing.T) {
 	// there are two (this one and the one actually used by the store).
 	fromTransport := storage.NewRaftTransport(log.AmbientContext{Tracer: mtc.storeConfig.Settings.Tracer},
 		cluster.MakeTestingClusterSettings(),
-		storage.GossipAddressResolver(fromStore.Gossip()),
+		nodedialer.New(mtc.rpcContext, gossip.AddressResolver(fromStore.Gossip())),
 		nil, /* grpcServer */
-		mtc.rpcContext,
+		mtc.transportStopper,
 	)
 	errChan := errorChannelTestHandler(make(chan *roachpb.Error, 1))
 	fromTransport.Listen(fromStore.StoreID(), errChan)
@@ -2692,7 +2694,7 @@ func TestStoreRangeRemoveDead(t *testing.T) {
 	origReplicas := getRangeMetadata(roachpb.RKeyMin, mtc, t).Replicas
 
 	for _, s := range mtc.stores {
-		if err := s.GossipStore(context.Background()); err != nil {
+		if err := s.GossipStore(context.Background(), false /* useCached */); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2728,7 +2730,7 @@ func TestStoreRangeRemoveDead(t *testing.T) {
 
 			// Keep gossiping the alive stores.
 			for _, s := range mtc.stores[:3] {
-				if err := s.GossipStore(context.Background()); err != nil {
+				if err := s.GossipStore(context.Background(), false /* useCached */); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -2993,9 +2995,9 @@ func TestReplicateRemovedNodeDisruptiveElection(t *testing.T) {
 	// there are two (this one and the one actually used by the store).
 	transport0 := storage.NewRaftTransport(log.AmbientContext{Tracer: mtc.storeConfig.Settings.Tracer},
 		cluster.MakeTestingClusterSettings(),
-		storage.GossipAddressResolver(mtc.gossips[0]),
+		nodedialer.New(mtc.rpcContext, gossip.AddressResolver(mtc.gossips[0])),
 		nil, /* grpcServer */
-		mtc.rpcContext,
+		mtc.transportStopper,
 	)
 	errChan := errorChannelTestHandler(make(chan *roachpb.Error, 1))
 	transport0.Listen(mtc.stores[0].StoreID(), errChan)

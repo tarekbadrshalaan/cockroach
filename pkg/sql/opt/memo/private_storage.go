@@ -83,6 +83,9 @@ func (ps *privateStorage) lookup(id PrivateID) interface{} {
 	return ps.privates[id]
 }
 
+// EmptyTupleType represents an empty types.TTuple.
+var EmptyTupleType types.TTuple
+
 // internColumnID adds the given value to storage and returns an id that can
 // later be used to retrieve the value by calling the lookup method. If the
 // value has been previously added to storage, then internColumnID always
@@ -113,6 +116,22 @@ func (ps *privateStorage) internColList(colList opt.ColList) PrivateID {
 		return id
 	}
 	return ps.addValue(privateKey{iface: typ, str: ps.keyBuf.String()}, colList)
+}
+
+// internTupleOrdinal adds the given value to storage and returns an id that
+// can later be used to retrieve the value by calling the lookup method. If the
+// value has been previously added to storage, then internTupleOrdinal always
+// returns the same private id that was returned from the previous call.
+func (ps *privateStorage) internTupleOrdinal(tupleOrdinal TupleOrdinal) PrivateID {
+	// The below code is carefully constructed to not allocate in the case
+	// where the value is already in the map. Be careful when modifying.
+	ps.keyBuf.Reset()
+	ps.keyBuf.writeUvarint(uint64(tupleOrdinal))
+	typ := (*TupleOrdinal)(nil)
+	if id, ok := ps.privatesMap[privateKey{iface: typ, str: ps.keyBuf.String()}]; ok {
+		return id
+	}
+	return ps.addValue(privateKey{iface: typ, str: ps.keyBuf.String()}, tupleOrdinal)
 }
 
 // internOperator adds the given value to storage and returns an id that can
@@ -229,6 +248,24 @@ func (ps *privateStorage) internScanOpDef(def *ScanOpDef) PrivateID {
 	return ps.addValue(privateKey{iface: typ, str: ps.keyBuf.String()}, def)
 }
 
+// internVirtualScanOpDef adds the given value to storage and returns an id that
+// can later be used to retrieve the value by calling the lookup method. If the
+// value has been previously added to storage, then internVirtualScanOpDef
+// always  returns the same private id that was returned from the previous call.
+func (ps *privateStorage) internVirtualScanOpDef(def *VirtualScanOpDef) PrivateID {
+	// The below code is carefully constructed to not allocate in the case where
+	// the value is already in the map. Be careful when modifying.
+	ps.keyBuf.Reset()
+	ps.keyBuf.writeUvarint(uint64(def.Table))
+	ps.keyBuf.writeColSet(def.Cols)
+
+	typ := (*VirtualScanOpDef)(nil)
+	if id, ok := ps.privatesMap[privateKey{iface: typ, str: ps.keyBuf.String()}]; ok {
+		return id
+	}
+	return ps.addValue(privateKey{iface: typ, str: ps.keyBuf.String()}, def)
+}
+
 // internGroupByDef adds the given value to storage and returns an id that can
 // later be used to retrieve the value by calling the lookup method. If the
 // value has been previously added to storage, then internGroupByDef always
@@ -331,8 +368,12 @@ func (ps *privateStorage) internMergeOnDef(def *MergeOnDef) PrivateID {
 	// the value is already in the map. Be careful when modifying.
 	ps.keyBuf.Reset()
 	ps.keyBuf.writeUvarint(uint64(def.JoinType))
-	ps.keyBuf.writeOrderingChoice(&def.LeftEq)
-	ps.keyBuf.writeOrderingChoice(&def.RightEq)
+	ps.keyBuf.writeOrdering(def.LeftEq)
+	ps.keyBuf.writeOrdering(def.RightEq)
+	ps.keyBuf.writeUvarint(0)
+	ps.keyBuf.writeOrderingChoice(&def.LeftOrdering)
+	ps.keyBuf.writeUvarint(0)
+	ps.keyBuf.writeOrderingChoice(&def.RightOrdering)
 	typ := (*MergeOnDef)(nil)
 	if id, ok := ps.privatesMap[privateKey{iface: typ, str: ps.keyBuf.String()}]; ok {
 		return id

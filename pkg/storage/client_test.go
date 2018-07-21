@@ -48,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -162,7 +163,7 @@ func createTestStoreWithEngine(
 
 	// Connect to gossip and gossip the store's capacity.
 	<-store.Gossip().Connected
-	if err := store.GossipStore(ctx); err != nil {
+	if err := store.GossipStore(ctx, false /* useCached */); err != nil {
 		t.Fatal(err)
 	}
 	// Wait for the store's single range to have quorum before proceeding.
@@ -190,7 +191,8 @@ type multiTestContext struct {
 		nodeIDtoAddr map[roachpb.NodeID]net.Addr
 	}
 
-	transport *storage.RaftTransport
+	nodeDialer *nodedialer.Dialer
+	transport  *storage.RaftTransport
 
 	// The per-store clocks slice normally contains aliases of
 	// multiTestContext.clock, but it may be populated before Start() to
@@ -284,8 +286,10 @@ func (m *multiTestContext) Start(t *testing.T, numStores int) {
 			})
 		}
 	}
+	m.nodeDialer = nodedialer.New(m.rpcContext, m.getNodeIDAddress)
 	m.transport = storage.NewRaftTransport(
-		log.AmbientContext{Tracer: st.Tracer}, st, m.getNodeIDAddress, nil, m.rpcContext,
+		log.AmbientContext{Tracer: st.Tracer}, st,
+		m.nodeDialer, nil, m.transportStopper,
 	)
 
 	for idx := 0; idx < numStores; idx++ {
@@ -367,7 +371,7 @@ func (m *multiTestContext) gossipStores() {
 	timestamps := make(map[string]int64)
 	for i := 0; i < len(m.stores); i++ {
 		<-m.gossips[i].Connected
-		if err := m.stores[i].GossipStore(context.Background()); err != nil {
+		if err := m.stores[i].GossipStore(context.Background(), false /* useCached */); err != nil {
 			m.t.Fatal(err)
 		}
 		infoStatus := m.gossips[i].GetInfoStatus()
@@ -421,7 +425,7 @@ type multiTestContextKVTransport struct {
 }
 
 func (m *multiTestContext) kvTransportFactory(
-	_ kv.SendOptions, _ *rpc.Context, replicas kv.ReplicaSlice, args roachpb.BatchRequest,
+	_ kv.SendOptions, _ *nodedialer.Dialer, replicas kv.ReplicaSlice, args roachpb.BatchRequest,
 ) (kv.Transport, error) {
 	t := &multiTestContextKVTransport{
 		mtc:      m,
@@ -621,6 +625,7 @@ func (m *multiTestContext) makeStoreConfig(i int) storage.StoreConfig {
 		cfg = storage.TestStoreConfig(m.clocks[i])
 		m.storeConfig = &cfg
 	}
+	cfg.NodeDialer = m.nodeDialer
 	cfg.Transport = m.transport
 	cfg.Gossip = m.gossips[i]
 	cfg.TestingKnobs.DisableSplitQueue = true
@@ -1179,14 +1184,7 @@ func (m *multiTestContext) transferLeaseNonFatal(
 	// advanced recently, so all the liveness records (including the destination)
 	// are expired. In that case, the simple fact that the transfer succeeded
 	// doesn't mean that the destination now has a usable lease.
-	m.mu.RLock()
-	nl := m.nodeLivenesses[dest]
-	m.mu.RUnlock()
-	l, err := nl.Self()
-	if err != nil {
-		return err
-	}
-	if err := nl.Heartbeat(ctx, l); err != nil {
+	if err := m.heartbeatLiveness(ctx, dest); err != nil {
 		return err
 	}
 
@@ -1194,11 +1192,22 @@ func (m *multiTestContext) transferLeaseNonFatal(
 	if err != nil {
 		return err
 	}
-	if err := sourceRepl.AdminTransferLease(context.Background(), m.idents[dest].StoreID); err != nil {
+	if err := sourceRepl.AdminTransferLease(ctx, m.idents[dest].StoreID); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (m *multiTestContext) heartbeatLiveness(ctx context.Context, store int) error {
+	m.mu.RLock()
+	nl := m.nodeLivenesses[store]
+	m.mu.RUnlock()
+	l, err := nl.Self()
+	if err != nil {
+		return err
+	}
+	return nl.Heartbeat(ctx, l)
 }
 
 // advanceClock advances the mtc's manual clock such that all

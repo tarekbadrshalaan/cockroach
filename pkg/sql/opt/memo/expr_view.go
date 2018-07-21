@@ -250,19 +250,27 @@ func (ev ExprView) format(f *opt.ExprFmtCtx, tp treeprinter.Node) {
 
 func (ev ExprView) formatRelational(f *opt.ExprFmtCtx, tp treeprinter.Node) {
 	var buf bytes.Buffer
+	formatter := ev.mem.makeExprFormatter(&buf)
 
-	// Special case for merge-join: we want the type of the join to show up
-	if ev.Operator() == opt.MergeJoinOp {
+	// Special cases for merge-join and lookup-join: we want the type of the join
+	// to show up first.
+	switch ev.Operator() {
+	case opt.MergeJoinOp:
 		def := ev.Child(2).Private().(*MergeOnDef)
 		fmt.Fprintf(&buf, "%v (merge)", def.JoinType)
-	} else {
-		fmt.Fprintf(&buf, "%v", ev.op)
-	}
 
-	switch ev.Operator() {
-	case opt.ScanOp, opt.IndexJoinOp, opt.ShowTraceForSessionOp:
-		formatter := ev.mem.makeExprFormatter(&buf)
+	case opt.LookupJoinOp:
+		def := ev.Private().(*LookupJoinDef)
+		fmt.Fprintf(&buf, "%v (lookup", def.JoinType)
+		formatter.formatPrivate(def, formatNormal)
+		buf.WriteByte(')')
+
+	case opt.ScanOp, opt.VirtualScanOp, opt.IndexJoinOp, opt.ShowTraceForSessionOp:
+		fmt.Fprintf(&buf, "%v", ev.op)
 		formatter.formatPrivate(ev.Private(), formatNormal)
+
+	default:
+		fmt.Fprintf(&buf, "%v", ev.op)
 	}
 
 	var physProps *props.Physical
@@ -317,11 +325,13 @@ func (ev ExprView) formatRelational(f *opt.ExprFmtCtx, tp treeprinter.Node) {
 	switch ev.Operator() {
 	// Special-case handling for GroupBy private; print grouping columns and
 	// ordering in addition to full set of columns.
-	case opt.GroupByOp:
+	case opt.GroupByOp, opt.ScalarGroupByOp:
 		def := ev.Private().(*GroupByDef)
 		groupingColSet := def.GroupingCols
 		ordering := def.Ordering
-		logProps.FormatColSet(f, tp, "grouping columns:", groupingColSet)
+		if !groupingColSet.Empty() {
+			logProps.FormatColSet(f, tp, "grouping columns:", groupingColSet)
+		}
 		if !ordering.Any() {
 			tp.Childf("ordering: %s", ordering.String())
 		}
@@ -345,8 +355,13 @@ func (ev ExprView) formatRelational(f *opt.ExprFmtCtx, tp treeprinter.Node) {
 
 	case opt.LookupJoinOp:
 		def := ev.Private().(*LookupJoinDef)
-		tp.Childf("type: %v", def.JoinType)
-		tp.Childf("key columns: %v", def.KeyCols)
+		buf.Reset()
+		idxCols := make(opt.ColList, len(def.KeyCols))
+		idx := ev.mem.metadata.Table(def.Table).Index(def.Index)
+		for i := range idxCols {
+			idxCols[i] = ev.mem.metadata.TableColumn(def.Table, idx.Column(i).Ordinal)
+		}
+		tp.Childf("key columns: %v = %v", def.KeyCols, idxCols)
 	}
 
 	if !f.HasFlags(opt.ExprFmtHideOuterCols) && !logProps.Relational.OuterCols.Empty() {
@@ -356,7 +371,7 @@ func (ev ExprView) formatRelational(f *opt.ExprFmtCtx, tp treeprinter.Node) {
 	if !f.HasFlags(opt.ExprFmtHideRowCard) {
 		if logProps.Relational.Cardinality != props.AnyCardinality {
 			// Suppress cardinality for Scan ops if it's redundant with Limit field.
-			if ev.Operator() != opt.ScanOp || !logProps.Relational.Cardinality.CanBeZero() {
+			if ev.Operator() != opt.ScanOp || ev.Private().(*ScanOpDef).HardLimit == 0 {
 				tp.Childf("cardinality: %s", logProps.Relational.Cardinality)
 			}
 		}
@@ -394,6 +409,9 @@ func (ev ExprView) formatRelational(f *opt.ExprFmtCtx, tp treeprinter.Node) {
 		r := &logProps.Relational.Rule
 		if !r.PruneCols.Empty() {
 			tp.Childf("prune: %s", r.PruneCols.String())
+		}
+		if !r.RejectNullCols.Empty() {
+			tp.Childf("reject-nulls: %s", r.RejectNullCols.String())
 		}
 		if len(r.InterestingOrderings) > 0 {
 			tp.Childf("interesting orderings: %s", r.InterestingOrderings.String())
@@ -489,7 +507,7 @@ func (ev ExprView) FormatScalarProps(f *opt.ExprFmtCtx, buf *bytes.Buffer) {
 
 func (ev ExprView) formatScalarPrivate(buf *bytes.Buffer, private interface{}) {
 	switch ev.op {
-	case opt.NullOp:
+	case opt.NullOp, opt.TupleOp:
 		// Private is redundant with logical type property.
 		private = nil
 

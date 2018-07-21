@@ -59,8 +59,6 @@ func TestImportData(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
-	sqlDB.Exec(t, `CREATE DATABASE d`)
-
 	tests := []struct {
 		name   string
 		create string
@@ -166,6 +164,13 @@ d
 			typ:    "CSV",
 			data:   `\x0`,
 			err:    "odd length hex string",
+		},
+		{
+			name:   "oversample",
+			create: `i int`,
+			with:   `WITH oversample = '100'`,
+			typ:    "CSV",
+			data:   "1",
 		},
 
 		// MySQL OUTFILE
@@ -305,6 +310,20 @@ d
 			with:   `WITH max_row_size = '5B'`,
 			err:    "line too long",
 		},
+		{
+			name:   "not enough values",
+			typ:    "PGCOPY",
+			create: "a INT, b INT",
+			data:   `1`,
+			err:    "expected 2 values, got 1",
+		},
+		{
+			name:   "too many values",
+			typ:    "PGCOPY",
+			create: "a INT, b INT",
+			data:   "1\t2\t3",
+			err:    "expected 2 values, got 3",
+		},
 
 		// Postgres DUMP
 		{
@@ -355,6 +374,113 @@ d
 			with: `WITH max_row_size = '5B'`,
 			err:  "line too long",
 		},
+		{
+			name: "not enough values",
+			typ:  "PGDUMP",
+			data: `
+CREATE TABLE d.t (a INT, b INT);
+
+COPY t (a, b) FROM stdin;
+1
+\.
+			`,
+			err: "expected 2 values, got 1",
+		},
+		{
+			name: "too many values",
+			typ:  "PGDUMP",
+			data: `
+CREATE TABLE d.t (a INT, b INT);
+
+COPY t (a, b) FROM stdin;
+1	2	3
+\.
+			`,
+			err: "expected 2 values, got 3",
+		},
+		{
+			name: "too many cols",
+			typ:  "PGDUMP",
+			data: `
+CREATE TABLE d.t (a INT, b INT);
+
+COPY t (a, b, c) FROM stdin;
+1	2	3
+\.
+			`,
+			err: "expected 2 columns, got 3",
+		},
+		{
+			name: "fk",
+			typ:  "PGDUMP",
+			data: testPgdumpFk,
+			query: map[string][][]string{
+				`SHOW TABLES`:              {{"cities"}, {"weather"}},
+				`SELECT city FROM cities`:  {{"Berkeley"}},
+				`SELECT city FROM weather`: {{"Berkeley"}},
+
+				`SELECT dependson_name
+				FROM crdb_internal.backward_dependencies
+				`: {{"weather_city_fkey"}},
+
+				`SELECT create_statement
+				FROM crdb_internal.create_statements
+				WHERE descriptor_name in ('cities', 'weather')
+				ORDER BY descriptor_name
+				`: {{testPgdumpCreateCities}, {testPgdumpCreateWeather}},
+
+				// Verify the constraint is unvalidated.
+				`SHOW CONSTRAINTS FROM weather
+				`: {{"weather", "weather_city_fkey", "FOREIGN KEY", "FOREIGN KEY (city) REFERENCES cities (city)", "false"}},
+			},
+		},
+		{
+			name: "fk-skip",
+			typ:  "PGDUMP",
+			data: testPgdumpFk,
+			with: `WITH skip_foreign_keys`,
+			query: map[string][][]string{
+				`SHOW TABLES`: {{"cities"}, {"weather"}},
+				// Verify the constraint is skipped.
+				`SELECT dependson_name FROM crdb_internal.backward_dependencies`: {},
+				`SHOW CONSTRAINTS FROM weather`:                                  {},
+			},
+		},
+		{
+			name: "fk unreferenced",
+			typ:  "TABLE weather FROM PGDUMP",
+			data: testPgdumpFk,
+			err:  `table "cities" not found`,
+		},
+		{
+			name: "fk unreferenced skipped",
+			typ:  "TABLE weather FROM PGDUMP",
+			data: testPgdumpFk,
+			with: `WITH skip_foreign_keys`,
+			query: map[string][][]string{
+				`SHOW TABLES`: {{"weather"}},
+			},
+		},
+		{
+			name: "sequence",
+			typ:  "PGDUMP",
+			data: `
+					CREATE TABLE t (a INT);
+					CREATE SEQUENCE public.i_seq
+						START WITH 1
+						INCREMENT BY 1
+						NO MINVALUE
+						NO MAXVALUE
+						CACHE 1;
+					ALTER SEQUENCE public.i_seq OWNED BY public.i.id;
+					ALTER TABLE ONLY t ALTER COLUMN a SET DEFAULT nextval('public.i_seq'::regclass);
+					SELECT pg_catalog.setval('public.i_seq', 10, true);
+				`,
+			query: map[string][][]string{
+				`SELECT nextval('i_seq')`:    {{"11"}},
+				`SHOW CREATE SEQUENCE i_seq`: {{"i_seq", "CREATE SEQUENCE i_seq MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1"}},
+			},
+		},
 
 		// Error
 		{
@@ -367,7 +493,7 @@ d
 			name:   "sequences",
 			create: `i int default nextval('s')`,
 			typ:    "CSV",
-			err:    `sequence operations unsupported`,
+			err:    `"s" not found`,
 		},
 	}
 
@@ -379,9 +505,15 @@ d
 	}))
 	defer srv.Close()
 
+	// Create and drop a table to make sure a descriptor ID gets used to verify
+	// ID rewrites happen correctly. Useful when running just a single test.
+	sqlDB.Exec(t, `CREATE TABLE blah (i int)`)
+	sqlDB.Exec(t, `DROP TABLE blah`)
+
 	for _, tc := range tests {
 		t.Run(fmt.Sprintf("%s: %s", tc.typ, tc.name), func(t *testing.T) {
-			sqlDB.Exec(t, `DROP TABLE IF EXISTS d.t`)
+			sqlDB.Exec(t, `CREATE DATABASE d; USE d`)
+			defer sqlDB.Exec(t, `DROP DATABASE d`)
 			var q string
 			if tc.create != "" {
 				q = fmt.Sprintf(`IMPORT TABLE d.t (%s) %s DATA ($1) %s`, tc.create, tc.typ, tc.with)
@@ -401,12 +533,62 @@ d
 	}
 
 	t.Run("mysqlout multiple", func(t *testing.T) {
+		sqlDB.Exec(t, `CREATE DATABASE d; USE d`)
 		sqlDB.Exec(t, `DROP TABLE IF EXISTS d.t`)
 		dataString = "1"
 		sqlDB.Exec(t, `IMPORT TABLE d.t (s STRING) MYSQLOUTFILE DATA ($1, $1)`, srv.URL)
 		sqlDB.CheckQueryResults(t, `SELECT * FROM d.t`, [][]string{{"1"}, {"1"}})
 	})
 }
+
+const (
+	testPgdumpCreateCities = `CREATE TABLE cities (
+	city STRING(80) NOT NULL,
+	CONSTRAINT cities_pkey PRIMARY KEY (city ASC),
+	FAMILY "primary" (city)
+)`
+	testPgdumpCreateWeather = `CREATE TABLE weather (
+	city STRING(80) NULL,
+	temp_lo INTEGER NULL,
+	temp_hi INTEGER NULL,
+	prcp REAL NULL,
+	date DATE NULL,
+	CONSTRAINT weather_city_fkey FOREIGN KEY (city) REFERENCES cities (city),
+	INDEX weather_auto_index_weather_city_fkey (city ASC),
+	FAMILY "primary" (city, temp_lo, temp_hi, prcp, date, rowid)
+)`
+	testPgdumpFk = `
+CREATE TABLE cities (
+    city character varying(80) NOT NULL
+);
+
+ALTER TABLE cities OWNER TO postgres;
+
+CREATE TABLE weather (
+    city character varying(80),
+    temp_lo integer,
+    temp_hi integer,
+    prcp real,
+    date date
+);
+
+ALTER TABLE weather OWNER TO postgres;
+
+COPY cities (city) FROM stdin;
+Berkeley
+\.
+
+COPY weather (city, temp_lo, temp_hi, prcp, date) FROM stdin;
+Berkeley	45	53	0	1994-11-28
+\.
+
+ALTER TABLE ONLY cities
+    ADD CONSTRAINT cities_pkey PRIMARY KEY (city);
+
+ALTER TABLE ONLY weather
+    ADD CONSTRAINT weather_city_fkey FOREIGN KEY (city) REFERENCES cities(city);
+`
+)
 
 // TODO(dt): switch to a helper in sampledataccl.
 func makeCSVData(
@@ -1079,7 +1261,7 @@ func BenchmarkConvertRecord(b *testing.B) {
 	create := stmt.(*tree.CreateTable)
 	st := cluster.MakeTestingClusterSettings()
 
-	tableDesc, err := MakeSimpleTableDescriptor(ctx, st, create, sqlbase.ID(100), sqlbase.ID(100), 1)
+	tableDesc, err := MakeSimpleTableDescriptor(ctx, st, create, sqlbase.ID(100), sqlbase.ID(100), NoFKs, 1)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -1940,6 +2122,25 @@ func TestImportPgDump(t *testing.T) {
 				if !testutils.IsError(err, expected) {
 					t.Fatalf("expected %s, got %v", expected, err)
 				}
+			}
+			if c.expected == expectAll {
+				sqlDB.CheckQueryResults(t, `SHOW CREATE TABLE seqtable`, [][]string{{
+					"seqtable", `CREATE TABLE seqtable (
+	a INTEGER NULL DEFAULT nextval('public.a_seq':::STRING),
+	b INTEGER NULL,
+	FAMILY "primary" (a, b, rowid)
+)`,
+				}})
+				sqlDB.CheckQueryResults(t, `SHOW CREATE SEQUENCE a_seq`, [][]string{{
+					"a_seq", `CREATE SEQUENCE a_seq MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1`,
+				}})
+				sqlDB.CheckQueryResults(t, `select last_value from a_seq`, [][]string{{"7"}})
+				sqlDB.Exec(t, `INSERT INTO seqtable (b) VALUES (70)`)
+				sqlDB.CheckQueryResults(t,
+					`SELECT * FROM seqtable ORDER BY a`,
+					sqlDB.QueryStr(t, `select a+1, a*10 from generate_series(0, 7) a`),
+				)
+				sqlDB.CheckQueryResults(t, `select last_value from a_seq`, [][]string{{"8"}})
 			}
 		})
 	}

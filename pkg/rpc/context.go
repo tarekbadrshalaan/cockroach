@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -246,7 +247,7 @@ func (c *Connection) Connect(ctx context.Context) (*grpc.ClientConn, error) {
 	// If connection is invalid, return latest heartbeat error.
 	h := c.heartbeatResult.Load().(heartbeatResult)
 	if !h.everSucceeded {
-		return nil, errors.Wrap(h.err, "initial connection heartbeat failed")
+		return nil, netutil.NewInitialHeartBeatFailedError(h.err)
 	}
 	return c.grpcConn, nil
 }
@@ -255,6 +256,13 @@ func (c *Connection) setInitialHeartbeatDone() {
 	c.validatedOnce.Do(func() {
 		close(c.initialHeartbeatDone)
 	})
+}
+
+// Health returns an error indicating the success or failure of the
+// connection's latest heartbeat. Returns ErrNotHeartbeated if the
+// first heartbeat has not completed.
+func (c *Connection) Health() error {
+	return c.heartbeatResult.Load().(heartbeatResult).err
 }
 
 // Context contains the fields required by the rpc framework.
@@ -548,7 +556,7 @@ func (ctx *Context) ConnHealth(target string) error {
 		return nil
 	}
 	conn := ctx.GRPCDial(target)
-	return conn.heartbeatResult.Load().(heartbeatResult).err
+	return conn.Health()
 }
 
 func (ctx *Context) runHeartbeat(

@@ -104,11 +104,30 @@ type SemaRejectFlags int
 
 // Valid values for SemaRejectFlags.
 const (
-	AllowAll         SemaRejectFlags = 0
+	AllowAll SemaRejectFlags = 0
+
+	// RejectAggregates rejects min(), max(), etc.
 	RejectAggregates SemaRejectFlags = 1 << iota
+
+	// RejectWindowApplications rejects "x() over y", etc.
 	RejectWindowApplications
+
+	// RejectGenerators rejects any use of SRFs, e.g "generate_series()".
 	RejectGenerators
+
+	// RejectNestedGenerators rejects any use of SRFs inside the
+	// argument list of another function call, which can itself be a SRF
+	// (RejectGenerators notwithstanding).
+	// This is used e.g. when processing the calls inside ROWS FROM.
+	RejectNestedGenerators
+
+	// RejectImpureFunctions rejects any non-const functions like now().
 	RejectImpureFunctions
+
+	// RejectSubqueries rejects subqueries in scalar contexts.
+	RejectSubqueries
+
+	// RejectSpecial is used in common places like the LIMIT clause.
 	RejectSpecial SemaRejectFlags = RejectAggregates | RejectGenerators | RejectWindowApplications
 )
 
@@ -132,6 +151,11 @@ type ScalarProperties struct {
 	// SeenImpureFunctions is set to true if the expression originally
 	// contained an impure function.
 	SeenImpure bool
+
+	// inFuncExpr is temporarily set to true while type checking the
+	// parameters of a function. Used to process RejectNestedGenerators
+	// properly.
+	inFuncExpr bool
 }
 
 // Clear resets the scalar properties to defaults.
@@ -509,7 +533,11 @@ func (expr *TupleStar) ResolvedType() types.T {
 
 // TypeCheck implements the Expr interface.
 func (expr *ColumnAccessExpr) TypeCheck(ctx *SemaContext, desired types.T) (TypedExpr, error) {
-	subExpr, err := expr.Expr.TypeCheck(ctx, desired)
+	// If the context requires types T, we need to ask "Any tuple with
+	// at least this label and the element type T for this label" from
+	// the sub-expression. Of course, our type system does not support
+	// this. So drop the type constraint instead.
+	subExpr, err := expr.Expr.TypeCheck(ctx, types.Any)
 	if err != nil {
 		return nil, err
 	}
@@ -608,6 +636,12 @@ var (
 	errInsufficientPriv     = pgerror.NewError(pgerror.CodeInsufficientPrivilegeError, "insufficient privilege")
 )
 
+// NewInvalidNestedSRFError creates a rejection for a nested SRF.
+func NewInvalidNestedSRFError(context string) error {
+	return pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError,
+		"set-returning functions must appear at the top level of %s", context)
+}
+
 // NewInvalidFunctionUsageError creates a rejection for a special function.
 func NewInvalidFunctionUsageError(class FunctionClass, context string) error {
 	var cat string
@@ -639,7 +673,7 @@ func (sc *SemaContext) checkFunctionUsage(expr *FuncExpr, def *FunctionDefinitio
 	}
 
 	if sc == nil {
-		// We can't check anything furgher. Give up.
+		// We can't check anything further. Give up.
 		return nil
 	}
 
@@ -659,6 +693,10 @@ func (sc *SemaContext) checkFunctionUsage(expr *FuncExpr, def *FunctionDefinitio
 		}
 	}
 	if def.Class == GeneratorClass {
+		if sc.Properties.Derived.inFuncExpr &&
+			sc.Properties.required.rejectFlags&RejectNestedGenerators != 0 {
+			return NewInvalidNestedSRFError(sc.Properties.required.context)
+		}
 		if sc.Properties.required.rejectFlags&RejectGenerators != 0 {
 			return NewInvalidFunctionUsageError(GeneratorClass, sc.Properties.required.context)
 		}
@@ -689,7 +727,19 @@ func (expr *FuncExpr) TypeCheck(ctx *SemaContext, desired types.T) (TypedExpr, e
 	}
 
 	if err := ctx.checkFunctionUsage(expr, def); err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "%s()", def.Name)
+	}
+	if ctx != nil {
+		// We'll need to remember we are in a function application to
+		// generate suitable errors in checkFunctionUsage().  We cannot
+		// set ctx.inFuncExpr earlier (in particular not before the call
+		// to checkFunctionUsage() above) because the top-level FuncExpr
+		// must be acceptable even if it is a SRF and
+		// RejectNestedGenerators is set.
+		defer func(ctx *SemaContext, prev bool) {
+			ctx.Properties.Derived.inFuncExpr = prev
+		}(ctx, ctx.Properties.Derived.inFuncExpr)
+		ctx.Properties.Derived.inFuncExpr = true
 	}
 
 	typedSubExprs, fns, err := typeCheckOverloadedExprs(ctx, desired, def.Definition, false, expr.Exprs...)
@@ -971,7 +1021,11 @@ func (expr *RangeCond) TypeCheck(ctx *SemaContext, desired types.T) (TypedExpr, 
 }
 
 // TypeCheck implements the Expr interface.
-func (expr *Subquery) TypeCheck(_ *SemaContext, _ types.T) (TypedExpr, error) {
+func (expr *Subquery) TypeCheck(sc *SemaContext, _ types.T) (TypedExpr, error) {
+	if sc != nil && sc.Properties.required.rejectFlags&RejectSubqueries != 0 {
+		return nil, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError,
+			"subqueries are not allowed in %s", sc.Properties.required.context)
+	}
 	expr.assertTyped()
 	return expr, nil
 }
@@ -1985,7 +2039,7 @@ func (p PlaceholderTypes) ProcessPlaceholderAnnotations(stmt Statement) error {
 		}
 	}
 
-	WalkStmt(&v, stmt)
+	walkStmt(&v, stmt)
 	for placeholder, state := range v.placeholders {
 		if state.shouldAnnotate {
 			p[placeholder] = state.typ

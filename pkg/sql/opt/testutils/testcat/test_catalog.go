@@ -99,7 +99,11 @@ func (tc *Catalog) Table(name string) *Table {
 
 // AddTable adds the given test table to the catalog.
 func (tc *Catalog) AddTable(tab *Table) {
-	tc.tables[tab.Name.FQString()] = tab
+	fq := tab.Name.FQString()
+	if _, ok := tc.tables[fq]; ok {
+		panic(fmt.Errorf("table %q already exists", tree.ErrString(&tab.Name)))
+	}
+	tc.tables[fq] = tab
 }
 
 // ExecuteDDL parses the given DDL SQL statement and creates objects in the test
@@ -123,17 +127,49 @@ func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
 		tc.AlterTable(stmt)
 		return "", nil
 
+	case *tree.DropTable:
+		tc.DropTable(stmt)
+		return "", nil
+
 	default:
 		return "", fmt.Errorf("expected CREATE TABLE or ALTER TABLE statement but found: %v", stmt)
 	}
 }
 
+// qualifyTableName updates the given table name to include catalog and schema
+// if not already included.
+func (tc *Catalog) qualifyTableName(name *tree.TableName) {
+	if name.ExplicitSchema {
+		if name.ExplicitCatalog {
+			// Already 3 parts: nothing to do.
+			return
+		}
+
+		if name.SchemaName == tree.PublicSchemaName {
+			// Use the current database.
+			name.CatalogName = testDB
+			return
+		}
+
+		// Compatibility with CockroachDB v1.1: use D.public.T.
+		name.CatalogName = name.SchemaName
+		name.SchemaName = tree.PublicSchemaName
+		name.ExplicitCatalog = true
+		return
+	}
+
+	// Use the current database.
+	name.CatalogName = testDB
+	name.SchemaName = tree.PublicSchemaName
+}
+
 // Table implements the opt.Table interface for testing purposes.
 type Table struct {
-	Name    tree.TableName
-	Columns []*Column
-	Indexes []*Index
-	Stats   TableStats
+	Name      tree.TableName
+	Columns   []*Column
+	Indexes   []*Index
+	Stats     TableStats
+	IsVirtual bool
 }
 
 var _ opt.Table = &Table{}
@@ -145,13 +181,13 @@ func (tt *Table) String() string {
 }
 
 // TabName is part of the opt.Table interface.
-func (tt *Table) TabName() opt.TableName {
-	return opt.TableName(tt.Name.TableName)
+func (tt *Table) TabName() *tree.TableName {
+	return &tt.Name
 }
 
 // IsVirtualTable is part of the opt.Table interface.
 func (tt *Table) IsVirtualTable() bool {
-	return false
+	return tt.IsVirtual
 }
 
 // ColumnCount is part of the opt.Table interface.
@@ -211,6 +247,9 @@ type Index struct {
 	// index, which allows duplicate rows when at least one of the values is
 	// NULL. See the opt.Index.LaxKeyColumnCount for more details.
 	LaxKeyCount int
+
+	// Inverted is true when this index is an inverted index.
+	Inverted bool
 }
 
 // IdxName is part of the opt.Index interface.
@@ -220,7 +259,7 @@ func (ti *Index) IdxName() string {
 
 // IsInverted is part of the opt.Index interface.
 func (ti *Index) IsInverted() bool {
-	return false
+	return ti.Inverted
 }
 
 // ColumnCount is part of the opt.Index interface.

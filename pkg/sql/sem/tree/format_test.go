@@ -54,9 +54,24 @@ func TestFormatStatement(t *testing.T) {
 		{`SHOW COLUMNS FROM foo`, tree.FmtAnonymize,
 			`SHOW COLUMNS FROM _`},
 		{`SHOW CREATE TABLE foo`, tree.FmtAnonymize,
-			`SHOW CREATE TABLE _`},
+			`SHOW CREATE _`},
 		{`GRANT SELECT ON bar TO foo`, tree.FmtAnonymize,
 			`GRANT SELECT ON TABLE _ TO _`},
+
+		{`INSERT INTO a VALUES (0), (0), (0), (0), (0), (0)`,
+			tree.FmtHideConstants,
+			`INSERT INTO a VALUES (_), (__more5__)`},
+		{`INSERT INTO a VALUES (0, 0, 0, 0, 0, 0)`,
+			tree.FmtHideConstants,
+			`INSERT INTO a VALUES (_, _, __more4__)`},
+		{`INSERT INTO a VALUES (ARRAY[0, 0, 0, 0, 0, 0, 0])`,
+			tree.FmtHideConstants,
+			`INSERT INTO a VALUES (ARRAY[_, _, __more5__])`},
+		{`INSERT INTO a VALUES (ARRAY[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ` +
+			`0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ` +
+			`0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])`,
+			tree.FmtHideConstants,
+			`INSERT INTO a VALUES (ARRAY[_, _, __more30__])`},
 
 		{`SELECT 1+COALESCE(NULL, 'a', x)-ARRAY[3.14]`, tree.FmtHideConstants,
 			`SELECT (_ + COALESCE(_, _, x)) - ARRAY[_]`},
@@ -113,7 +128,7 @@ func TestFormatTableName(t *testing.T) {
 		{`SHOW COLUMNS FROM foo`,
 			`SHOW COLUMNS FROM xoxoxo`},
 		{`SHOW CREATE TABLE foo`,
-			`SHOW CREATE TABLE xoxoxo`},
+			`SHOW CREATE xoxoxo`},
 		// TODO(knz): TRUNCATE and GRANT table names are removed by
 		// tree.FmtAnonymize but not processed by table formatters.
 		//

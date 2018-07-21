@@ -1738,6 +1738,16 @@ func TestOptimizePuts(t *testing.T) {
 				true, true, true, true, true, false, false, false, false, false,
 			},
 		},
+		// Existing key at 09, ten puts, expect first nine puts are blind.
+		{
+			roachpb.Key("09"),
+			[]roachpb.Request{
+				&pArgs[0], &pArgs[1], &pArgs[2], &pArgs[3], &pArgs[4], &pArgs[5], &pArgs[6], &pArgs[7], &pArgs[8], &pArgs[9],
+			},
+			[]bool{
+				true, true, true, true, true, true, true, true, true, false,
+			},
+		},
 		// No existing key, ten puts + inc + ten cputs.
 		{
 			nil,
@@ -2103,9 +2113,9 @@ func TestReplicaCommandQueue(t *testing.T) {
 	for _, test := range testCases {
 		var addReqs []string
 		if test.cmd1Read {
-			addReqs = []string{"", "noop", "read"}
+			addReqs = []string{"", "read"}
 		} else {
-			addReqs = []string{"", "noop", "write"}
+			addReqs = []string{"", "write"}
 		}
 		for _, addReq := range addReqs {
 			for _, localKey := range []bool{false, true} {
@@ -2118,8 +2128,6 @@ func TestReplicaCommandQueue(t *testing.T) {
 					"%s-%s", readWriteLabels[test.cmd1Read], readWriteLabels[test.cmd2Read],
 				)
 				switch addReq {
-				case "noop":
-					testName += "-noop"
 				case "read":
 					testName += "-addRead"
 				case "write":
@@ -2164,11 +2172,6 @@ func TestReplicaCommandQueue(t *testing.T) {
 
 							if header.UserPriority == blockingPriority {
 								switch addReq {
-								case "noop":
-									// Add a noop request to make sure that its empty key
-									// doesn't cause additional blocking.
-									ba.Add(&roachpb.NoopRequest{})
-
 								case "read", "write":
 									// Additional reads and writes to unique keys do not
 									// cause additional blocking; the read/write nature of
@@ -5791,120 +5794,139 @@ func TestPushTxnSerializableRestart(t *testing.T) {
 func TestQueryIntentRequest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	for _, behavior := range []roachpb.QueryIntentRequest_IfMissingBehavior{
-		roachpb.QueryIntentRequest_DO_NOTHING,
-		roachpb.QueryIntentRequest_RETURN_ERROR,
-		roachpb.QueryIntentRequest_PREVENT,
-	} {
-		t.Run(fmt.Sprintf("behavior=%s", behavior), func(t *testing.T) {
-			tc := testContext{}
-			stopper := stop.NewStopper()
-			defer stopper.Stop(context.TODO())
-			tc.Start(t, stopper)
+	for _, iso := range []enginepb.IsolationType{enginepb.SNAPSHOT, enginepb.SERIALIZABLE} {
+		t.Run(iso.String(), func(t *testing.T) {
+			for _, behavior := range []roachpb.QueryIntentRequest_IfMissingBehavior{
+				roachpb.QueryIntentRequest_DO_NOTHING,
+				roachpb.QueryIntentRequest_RETURN_ERROR,
+				roachpb.QueryIntentRequest_PREVENT,
+			} {
+				if iso == enginepb.SNAPSHOT && behavior == roachpb.QueryIntentRequest_PREVENT {
+					// Cannot prevent SNAPSHOT transaction with QueryIntent.
+					continue
+				}
+				t.Run(fmt.Sprintf("behavior=%s", behavior), func(t *testing.T) {
 
-			key1 := roachpb.Key("a")
-			key2 := roachpb.Key("b")
-			txn := newTransaction("test", key1, 1, enginepb.SERIALIZABLE, tc.Clock())
+					tc := testContext{}
+					stopper := stop.NewStopper()
+					defer stopper.Stop(context.TODO())
+					tc.Start(t, stopper)
 
-			pArgs := putArgs(key1, []byte("value1"))
-			assignSeqNumsForReqs(txn, &pArgs)
-			if _, pErr := tc.SendWrappedWith(roachpb.Header{Txn: txn}, &pArgs); pErr != nil {
-				t.Fatal(pErr)
-			}
+					key1 := roachpb.Key("a")
+					key2 := roachpb.Key("b")
+					txn := newTransaction("test", key1, 1, iso, tc.Clock())
+					txn2 := newTransaction("test2", key2, 1, iso, tc.Clock())
 
-			queryIntent := func(
-				key []byte,
-				txnMeta enginepb.TxnMeta,
-				baTxn *roachpb.Transaction,
-				expectIntent bool,
-			) {
-				t.Helper()
-				qiArgs := queryIntentArgs(key, txnMeta, behavior)
-				qiRes, pErr := tc.SendWrappedWith(roachpb.Header{Txn: baTxn}, &qiArgs)
-				if behavior == roachpb.QueryIntentRequest_RETURN_ERROR && !expectIntent {
-					if _, ok := pErr.GetDetail().(*roachpb.IntentMissingError); !ok {
-						t.Fatalf("expected IntentMissingError, found %v", pErr)
+					pArgs := putArgs(key1, []byte("value1"))
+					assignSeqNumsForReqs(txn, &pArgs)
+					if _, pErr := tc.SendWrappedWith(roachpb.Header{Txn: txn}, &pArgs); pErr != nil {
+						t.Fatal(pErr)
 					}
-				} else {
+
+					queryIntent := func(
+						key []byte,
+						txnMeta enginepb.TxnMeta,
+						baTxn *roachpb.Transaction,
+						expectIntent bool,
+					) {
+						t.Helper()
+						qiArgs := queryIntentArgs(key, txnMeta, behavior)
+						qiRes, pErr := tc.SendWrappedWith(roachpb.Header{Txn: baTxn}, &qiArgs)
+						if behavior == roachpb.QueryIntentRequest_RETURN_ERROR && !expectIntent {
+							ownIntent := baTxn != nil && baTxn.ID == txnMeta.ID
+							if ownIntent && txnMeta.Timestamp.Less(txn.Timestamp) {
+								if _, ok := pErr.GetDetail().(*roachpb.TransactionRetryError); !ok {
+									t.Fatalf("expected TransactionRetryError, found %v %v", txnMeta, pErr)
+								}
+							} else {
+								if _, ok := pErr.GetDetail().(*roachpb.IntentMissingError); !ok {
+									t.Fatalf("expected IntentMissingError, found %v", pErr)
+								}
+							}
+						} else {
+							if pErr != nil {
+								t.Fatal(pErr)
+							}
+							if e, a := expectIntent, qiRes.(*roachpb.QueryIntentResponse).FoundIntent; e != a {
+								t.Fatalf("expected FoundIntent=%t but FoundIntent=%t", e, a)
+							}
+						}
+					}
+
+					for _, baTxn := range []*roachpb.Transaction{nil, txn, txn2} {
+						// Query the intent with the correct txn meta. Should see intent regardless
+						// of whether we're inside the txn or not.
+						queryIntent(key1, txn.TxnMeta, baTxn, true)
+
+						// Query an intent on a different key for the same transaction. Should not
+						// see an intent.
+						queryIntent(key2, txn.TxnMeta, baTxn, false)
+
+						// Query an intent on the same key for a different transaction. Should not
+						// see an intent.
+						diffIDMeta := txn.TxnMeta
+						diffIDMeta.ID = txn2.ID
+						queryIntent(key1, diffIDMeta, baTxn, false)
+
+						// Query the intent with a larger epoch. Should not see an intent.
+						largerEpochMeta := txn.TxnMeta
+						largerEpochMeta.Epoch++
+						queryIntent(key1, largerEpochMeta, baTxn, false)
+
+						// Query the intent with a smaller epoch. Should not see an intent.
+						smallerEpochMeta := txn.TxnMeta
+						smallerEpochMeta.Epoch--
+						queryIntent(key1, smallerEpochMeta, baTxn, false)
+
+						// Query the intent with a larger timestamp. Should see an intent.
+						// See the comment on QueryIntentRequest.Txn for an explanation of why
+						// the request behaves like this.
+						largerTSMeta := txn.TxnMeta
+						largerTSMeta.Timestamp = largerTSMeta.Timestamp.Next()
+						queryIntent(key1, largerTSMeta, baTxn, true)
+
+						// Query the intent with a smaller timestamp. Should not see an intent
+						// if transaction is serializable. Should see an intent if the transaction
+						// is SNAPSHOT.
+						smallerTSMeta := txn.TxnMeta
+						smallerTSMeta.Timestamp = smallerTSMeta.Timestamp.Prev()
+						queryIntent(key1, smallerTSMeta, baTxn, iso == enginepb.SNAPSHOT)
+
+						// Query the intent with a larger sequence number. Should not see an intent.
+						largerSeqMeta := txn.TxnMeta
+						largerSeqMeta.Sequence++
+						queryIntent(key1, largerSeqMeta, baTxn, false)
+
+						// Query the intent with a smaller sequence number. Should see an intent.
+						// See the comment on QueryIntentRequest.Txn for an explanation of why
+						// the request behaves like this.
+						smallerSeqMeta := txn.TxnMeta
+						smallerSeqMeta.Sequence--
+						queryIntent(key1, smallerSeqMeta, baTxn, true)
+					}
+
+					// Perform a write at key2. Depending on the behavior of the queryIntent
+					// that queried that key, this write should have different results.
+					pArgs2 := putArgs(key2, []byte("value2"))
+					assignSeqNumsForReqs(txn, &pArgs2)
+					ba := roachpb.BatchRequest{}
+					ba.Header = roachpb.Header{Txn: txn}
+					ba.Add(&pArgs2)
+					br, pErr := tc.Sender().Send(context.Background(), ba)
 					if pErr != nil {
 						t.Fatal(pErr)
 					}
-					if e, a := expectIntent, qiRes.(*roachpb.QueryIntentResponse).FoundIntent; e != a {
-						t.Fatalf("expected FoundIntent=%T but FoundIntent=%T", e, a)
+					tsBumped := br.Txn.Timestamp != br.Txn.OrigTimestamp
+					if behavior == roachpb.QueryIntentRequest_PREVENT {
+						if !tsBumped {
+							t.Fatalf("transaction timestamp not bumped: %v", br.Txn)
+						}
+					} else {
+						if tsBumped {
+							t.Fatalf("unexpected transaction timestamp bumped: %v", br.Txn)
+						}
 					}
-				}
-			}
-
-			for _, baTxn := range []*roachpb.Transaction{nil, txn} {
-				// Query the intent with the correct txn meta. Should see intent regardless
-				// of whether we're inside the txn or not.
-				queryIntent(key1, txn.TxnMeta, baTxn, true)
-
-				// Query an intent on a different key for the same transaction. Should not
-				// see an intent.
-				queryIntent(key2, txn.TxnMeta, baTxn, false)
-
-				// Query an intent on the same key for a different transaction. Should not
-				// see an intent.
-				diffIDMeta := txn.TxnMeta
-				diffIDMeta.ID = uuid.MakeV4()
-				queryIntent(key1, diffIDMeta, baTxn, false)
-
-				// Query the intent with a larger epoch. Should not see an intent.
-				largerEpochMeta := txn.TxnMeta
-				largerEpochMeta.Epoch++
-				queryIntent(key1, largerEpochMeta, baTxn, false)
-
-				// Query the intent with a smaller epoch. Should not see an intent.
-				smallerEpochMeta := txn.TxnMeta
-				smallerEpochMeta.Epoch--
-				queryIntent(key1, smallerEpochMeta, baTxn, false)
-
-				// Query the intent with a larger timestamp. Should see an intent.
-				// See the comment on QueryIntentRequest.Txn for an explanation of why
-				// the request behaves like this.
-				largerTSMeta := txn.TxnMeta
-				largerTSMeta.Timestamp = largerTSMeta.Timestamp.Next()
-				queryIntent(key1, largerTSMeta, baTxn, true)
-
-				// Query the intent with a smaller timestamp. Should not see an intent.
-				smallerTSMeta := txn.TxnMeta
-				smallerTSMeta.Timestamp = smallerTSMeta.Timestamp.Prev()
-				queryIntent(key1, smallerTSMeta, baTxn, false)
-
-				// Query the intent with a larger sequence number. Should not see an intent.
-				largerSeqMeta := txn.TxnMeta
-				largerSeqMeta.Sequence++
-				queryIntent(key1, largerSeqMeta, baTxn, false)
-
-				// Query the intent with a smaller sequence number. Should see an intent.
-				// See the comment on QueryIntentRequest.Txn for an explanation of why
-				// the request behaves like this.
-				smallerSeqMeta := txn.TxnMeta
-				smallerSeqMeta.Sequence--
-				queryIntent(key1, smallerSeqMeta, baTxn, true)
-			}
-
-			// Perform a write at key2. Depending on the behavior of the queryIntent
-			// that queried that key, this write should have different results.
-			pArgs2 := putArgs(key2, []byte("value2"))
-			assignSeqNumsForReqs(txn, &pArgs2)
-			ba := roachpb.BatchRequest{}
-			ba.Header = roachpb.Header{Txn: txn}
-			ba.Add(&pArgs2)
-			br, pErr := tc.Sender().Send(context.Background(), ba)
-			if pErr != nil {
-				t.Fatal(pErr)
-			}
-			tsBumped := br.Txn.Timestamp != br.Txn.OrigTimestamp
-			if behavior == roachpb.QueryIntentRequest_PREVENT {
-				if !tsBumped {
-					t.Fatalf("transaction timestamp not bumped: %v", br.Txn)
-				}
-			} else {
-				if tsBumped {
-					t.Fatalf("unexpected transaction timestamp bumped: %v", br.Txn)
-				}
+				})
 			}
 		})
 	}
@@ -8130,7 +8152,7 @@ func TestReplicaRefreshPendingCommandsTicks(t *testing.T) {
 		ticks := r.mu.ticks
 		r.mu.Unlock()
 		for ; (ticks % electionTicks) != 0; ticks++ {
-			if _, err := r.tick(); err != nil {
+			if _, err := r.tick(nil); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -8184,7 +8206,7 @@ func TestReplicaRefreshPendingCommandsTicks(t *testing.T) {
 		r.mu.Unlock()
 
 		// Tick raft.
-		if _, err := r.tick(); err != nil {
+		if _, err := r.tick(nil); err != nil {
 			t.Fatal(err)
 		}
 
@@ -9234,6 +9256,58 @@ func TestErrorInRaftApplicationClearsIntents(t *testing.T) {
 	}
 }
 
+// TestProposeWithAsyncConsensus tests that the proposal of a batch with
+// AsyncConsensus set to true will return its evaluation result before Raft
+// command has completed consensus and applied.
+func TestProposeWithAsyncConsensus(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tc := testContext{}
+	tsc := TestStoreConfig(nil)
+
+	var filterActive int32
+	blockRaftApplication := make(chan struct{})
+	tsc.TestingKnobs.TestingApplyFilter =
+		func(filterArgs storagebase.ApplyFilterArgs) *roachpb.Error {
+			if atomic.LoadInt32(&filterActive) == 1 {
+				<-blockRaftApplication
+			}
+			return nil
+		}
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.TODO())
+	tc.StartWithStoreConfig(t, stopper, tsc)
+	repl := tc.repl
+
+	var ba roachpb.BatchRequest
+	key := roachpb.Key("a")
+	put := putArgs(key, []byte("val"))
+	ba.Add(&put)
+	ba.Timestamp = tc.Clock().Now()
+	ba.AsyncConsensus = true
+
+	atomic.StoreInt32(&filterActive, 1)
+	exLease, _ := repl.GetLease()
+	ch, _, pErr := repl.propose(
+		context.Background(), exLease, ba, nil /* endCmds */, &allSpans,
+	)
+	if pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	// The result should be signaled before consensus.
+	propRes := <-ch
+	if propRes.Err != nil {
+		t.Fatalf("unexpected proposal result error: %v", propRes.Err)
+	}
+	if propRes.Reply == nil || len(propRes.Reply.Responses) != 1 {
+		t.Fatalf("expected proposal result with 1 response, found: %v", propRes.Reply)
+	}
+
+	// Stop blocking Raft application to allow everything to shut down cleanly.
+	close(blockRaftApplication)
+}
+
 func TestSplitMsgApps(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -9327,11 +9401,17 @@ func TestSplitMsgApps(t *testing.T) {
 }
 
 type testQuiescer struct {
+	desc           roachpb.RangeDescriptor
 	numProposals   int
 	status         *raft.Status
 	lastIndex      uint64
 	raftReady      bool
 	ownsValidLease bool
+	livenessMap    map[roachpb.NodeID]bool
+}
+
+func (q *testQuiescer) descRLocked() *roachpb.RangeDescriptor {
+	return &q.desc
 }
 
 func (q *testQuiescer) raftStatusRLocked() *raft.Status {
@@ -9368,6 +9448,13 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 			// true. The transform function is intended to perform one mutation to
 			// this quiescer so that shouldReplicaQuiesce will return false.
 			q := &testQuiescer{
+				desc: roachpb.RangeDescriptor{
+					Replicas: []roachpb.ReplicaDescriptor{
+						{NodeID: 1, ReplicaID: 1},
+						{NodeID: 2, ReplicaID: 2},
+						{NodeID: 3, ReplicaID: 3},
+					},
+				},
 				status: &raft.Status{
 					ID: 1,
 					HardState: raftpb.HardState{
@@ -9387,9 +9474,14 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 				lastIndex:      logIndex,
 				raftReady:      false,
 				ownsValidLease: true,
+				livenessMap: map[roachpb.NodeID]bool{
+					1: true,
+					2: true,
+					3: true,
+				},
 			}
 			q = transform(q)
-			_, ok := shouldReplicaQuiesce(context.Background(), q, hlc.Timestamp{}, q.numProposals)
+			_, ok := shouldReplicaQuiesce(context.Background(), q, hlc.Timestamp{}, q.numProposals, q.livenessMap)
 			if expected != ok {
 				t.Fatalf("expected %v, but found %v", expected, ok)
 			}
@@ -9449,6 +9541,28 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 		q.raftReady = true
 		return q
 	})
+	// Create a mismatch between the raft progress replica IDs and the
+	// replica IDs in the range descriptor.
+	for i := 0; i < 3; i++ {
+		test(false, func(q *testQuiescer) *testQuiescer {
+			q.desc.Replicas[i].ReplicaID = roachpb.ReplicaID(4 + i)
+			return q
+		})
+	}
+	// Pass a nil liveness map.
+	test(true, func(q *testQuiescer) *testQuiescer {
+		q.livenessMap = nil
+		return q
+	})
+	// Verify quiesce even when replica progress doesn't match, if
+	// the replica is on a non-live node.
+	for _, i := range []uint64{1, 2, 3} {
+		test(true, func(q *testQuiescer) *testQuiescer {
+			q.livenessMap[roachpb.NodeID(i)] = false
+			q.status.Progress[i] = raft.Progress{Match: invalidIndex}
+			return q
+		})
+	}
 }
 
 func TestReplicaRecomputeStats(t *testing.T) {
@@ -9652,7 +9766,7 @@ func TestReplicaLocalRetries(t *testing.T) {
 			},
 			batchFn: func(ts hlc.Timestamp) (ba roachpb.BatchRequest, expTS hlc.Timestamp) {
 				ba.Timestamp = ts.Prev()
-				expTS = ts.Prev() // won't write on init put
+				expTS = ts.Next()
 				iput := iPutArgs(roachpb.Key("b-iput"), []byte("put2"))
 				ba.Add(&iput)
 				return

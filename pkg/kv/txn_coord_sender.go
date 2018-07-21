@@ -142,9 +142,10 @@ type TxnCoordSender struct {
 	// is embedded in the interceptorAlloc struct, so the entire stack is
 	// allocated together with TxnCoordSender without any additional heap
 	// allocations necessary.
-	interceptorStack [2]txnInterceptor
+	interceptorStack [3]txnInterceptor
 	interceptorAlloc struct {
 		txnIntentCollector
+		txnPipeliner
 		txnSpanRefresher
 		txnLockGatekeeper // not in interceptorStack array.
 	}
@@ -386,13 +387,12 @@ func NewTxnCoordSenderFactory(
 
 // TransactionalSender is part of the TxnSenderFactory interface.
 func (tcf *TxnCoordSenderFactory) TransactionalSender(
-	typ client.TxnType, txn *roachpb.Transaction,
+	typ client.TxnType, meta roachpb.TxnCoordMeta,
 ) client.TxnSender {
 	tcs := &TxnCoordSender{
 		typ: typ,
 		TxnCoordSenderFactory: tcf,
 	}
-	tcs.mu.txn = txn.Clone()
 
 	// Create a stack of request/response interceptors. All of the objects in
 	// this stack are pre-allocated on the TxnCoordSender struct, so this just
@@ -407,10 +407,12 @@ func (tcf *TxnCoordSenderFactory) TransactionalSender(
 		st: tcf.st,
 		ri: ri,
 	}
+	tcs.interceptorAlloc.txnPipeliner = txnPipeliner{
+		st: tcf.st,
+	}
 	tcs.interceptorAlloc.txnSpanRefresher = txnSpanRefresher{
-		st:           tcf.st,
-		knobs:        &tcf.testingKnobs,
-		refreshValid: true,
+		st:    tcf.st,
+		knobs: &tcf.testingKnobs,
 		// We can only allow refresh span retries on root transactions
 		// because those are the only places where we have all of the
 		// refresh spans. If this is a leaf, as in a distributed sql flow,
@@ -424,6 +426,7 @@ func (tcf *TxnCoordSenderFactory) TransactionalSender(
 	}
 	tcs.interceptorStack = [...]txnInterceptor{
 		&tcs.interceptorAlloc.txnIntentCollector,
+		&tcs.interceptorAlloc.txnPipeliner,
 		&tcs.interceptorAlloc.txnSpanRefresher,
 	}
 	for i, reqInt := range tcs.interceptorStack {
@@ -434,6 +437,7 @@ func (tcf *TxnCoordSenderFactory) TransactionalSender(
 		}
 	}
 
+	tcs.augmentMetaLocked(meta)
 	return tcs
 }
 
@@ -474,6 +478,10 @@ func (tc *TxnCoordSender) AugmentMeta(ctx context.Context, meta roachpb.TxnCoord
 	if tc.mu.txn.ID != meta.Txn.ID {
 		return
 	}
+	tc.augmentMetaLocked(meta)
+}
+
+func (tc *TxnCoordSender) augmentMetaLocked(meta roachpb.TxnCoordMeta) {
 	tc.mu.txn.Update(&meta.Txn)
 	tc.mu.commandCount += meta.CommandCount
 	for _, reqInt := range tc.interceptorStack {
@@ -952,9 +960,8 @@ func (tc *TxnCoordSender) IsTracking() bool {
 }
 
 // updateStateLocked updates the transaction state in both the success and error
-// cases, applying those updates to the corresponding txnMeta object when
-// adequate. It also updates retryable errors with the updated transaction for
-// use by client restarts.
+// cases. It also updates retryable errors with the updated transaction for use
+// by client restarts.
 //
 // startNS is the time when the request that's updating the state has been sent.
 // This is not used if the request is known to not be the one in charge of

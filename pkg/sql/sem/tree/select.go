@@ -50,8 +50,14 @@ type Select struct {
 func (node *Select) Format(ctx *FmtCtx) {
 	ctx.FormatNode(node.With)
 	ctx.FormatNode(node.Select)
-	ctx.FormatNode(&node.OrderBy)
-	ctx.FormatNode(node.Limit)
+	if len(node.OrderBy) > 0 {
+		ctx.WriteByte(' ')
+		ctx.FormatNode(&node.OrderBy)
+	}
+	if node.Limit != nil {
+		ctx.WriteByte(' ')
+		ctx.FormatNode(node.Limit)
+	}
 }
 
 // ParenSelect represents a parenthesized SELECT/UNION/VALUES statement.
@@ -95,11 +101,26 @@ func (node *SelectClause) Format(ctx *FmtCtx) {
 			}
 		}
 		ctx.FormatNode(&node.Exprs)
-		ctx.FormatNode(node.From)
-		ctx.FormatNode(node.Where)
-		ctx.FormatNode(&node.GroupBy)
-		ctx.FormatNode(node.Having)
-		ctx.FormatNode(&node.Window)
+		if len(node.From.Tables) > 0 {
+			ctx.WriteByte(' ')
+			ctx.FormatNode(node.From)
+		}
+		if node.Where != nil {
+			ctx.WriteByte(' ')
+			ctx.FormatNode(node.Where)
+		}
+		if len(node.GroupBy) > 0 {
+			ctx.WriteByte(' ')
+			ctx.FormatNode(&node.GroupBy)
+		}
+		if node.Having != nil {
+			ctx.WriteByte(' ')
+			ctx.FormatNode(node.Having)
+		}
+		if len(node.Window) > 0 {
+			ctx.WriteByte(' ')
+			ctx.FormatNode(&node.Window)
+		}
 	}
 }
 
@@ -189,6 +210,7 @@ type From struct {
 
 // Format implements the NodeFormatter interface.
 func (node *From) Format(ctx *FmtCtx) {
+	ctx.WriteString("FROM ")
 	ctx.FormatNode(&node.Tables)
 	if node.AsOf.Expr != nil {
 		ctx.WriteByte(' ')
@@ -201,14 +223,11 @@ type TableExprs []TableExpr
 
 // Format implements the NodeFormatter interface.
 func (node *TableExprs) Format(ctx *FmtCtx) {
-	if len(*node) != 0 {
-		ctx.WriteString(" FROM ")
-		for i, n := range *node {
-			if i > 0 {
-				ctx.WriteString(", ")
-			}
-			ctx.FormatNode(n)
-		}
+	prefix := ""
+	for _, n := range *node {
+		ctx.WriteString(prefix)
+		ctx.FormatNode(n)
+		prefix = ", "
 	}
 }
 
@@ -424,12 +443,9 @@ func NewWhere(typ string, expr Expr) *Where {
 
 // Format implements the NodeFormatter interface.
 func (node *Where) Format(ctx *FmtCtx) {
-	if node != nil {
-		ctx.WriteByte(' ')
-		ctx.WriteString(node.Type)
-		ctx.WriteByte(' ')
-		ctx.FormatNode(node.Expr)
-	}
+	ctx.WriteString(node.Type)
+	ctx.WriteByte(' ')
+	ctx.FormatNode(node.Expr)
 }
 
 // GroupBy represents a GROUP BY clause.
@@ -437,7 +453,7 @@ type GroupBy []Expr
 
 // Format implements the NodeFormatter interface.
 func (node *GroupBy) Format(ctx *FmtCtx) {
-	prefix := " GROUP BY "
+	prefix := "GROUP BY "
 	for _, n := range *node {
 		ctx.WriteString(prefix)
 		ctx.FormatNode(n)
@@ -460,7 +476,7 @@ type OrderBy []*Order
 
 // Format implements the NodeFormatter interface.
 func (node *OrderBy) Format(ctx *FmtCtx) {
-	prefix := " ORDER BY "
+	prefix := "ORDER BY "
 	for _, n := range *node {
 		ctx.WriteString(prefix)
 		ctx.FormatNode(n)
@@ -540,15 +556,18 @@ type Limit struct {
 
 // Format implements the NodeFormatter interface.
 func (node *Limit) Format(ctx *FmtCtx) {
-	if node != nil {
-		if node.Count != nil {
-			ctx.WriteString(" LIMIT ")
-			ctx.FormatNode(node.Count)
+	needSpace := false
+	if node.Count != nil {
+		ctx.WriteString("LIMIT ")
+		ctx.FormatNode(node.Count)
+		needSpace = true
+	}
+	if node.Offset != nil {
+		if needSpace {
+			ctx.WriteByte(' ')
 		}
-		if node.Offset != nil {
-			ctx.WriteString(" OFFSET ")
-			ctx.FormatNode(node.Offset)
-		}
+		ctx.WriteString("OFFSET ")
+		ctx.FormatNode(node.Offset)
 	}
 }
 
@@ -569,7 +588,7 @@ type Window []*WindowDef
 
 // Format implements the NodeFormatter interface.
 func (node *Window) Format(ctx *FmtCtx) {
-	prefix := " WINDOW "
+	prefix := "WINDOW "
 	for _, n := range *node {
 		ctx.WriteString(prefix)
 		ctx.FormatNode(&n.Name)
@@ -596,7 +615,7 @@ func (node *WindowDef) Format(ctx *FmtCtx) {
 		ctx.FormatNode(&node.RefName)
 		needSpaceSeparator = true
 	}
-	if node.Partitions != nil {
+	if len(node.Partitions) > 0 {
 		if needSpaceSeparator {
 			ctx.WriteByte(' ')
 		}
@@ -604,20 +623,16 @@ func (node *WindowDef) Format(ctx *FmtCtx) {
 		ctx.FormatNode(&node.Partitions)
 		needSpaceSeparator = true
 	}
-	if node.OrderBy != nil {
+	if len(node.OrderBy) > 0 {
 		if needSpaceSeparator {
-			ctx.FormatNode(&node.OrderBy)
-		} else {
-			// We need to remove the initial space produced by OrderBy.Format.
-			// TODO(knz): this code is horrendous. Figure a way to remove it.
-			orderByStr := AsStringWithFlags(&node.OrderBy, ctx.flags)
-			ctx.WriteString(orderByStr[1:])
+			ctx.WriteByte(' ')
 		}
+		ctx.FormatNode(&node.OrderBy)
 		needSpaceSeparator = true
 	}
 	if node.Frame != nil {
 		if needSpaceSeparator {
-			ctx.WriteRune(' ')
+			ctx.WriteByte(' ')
 		}
 		ctx.FormatNode(node.Frame)
 	}
@@ -669,53 +684,42 @@ type WindowFrame struct {
 	Bounds WindowFrameBounds // the bounds of the frame
 }
 
-func (boundary *WindowFrameBound) write(ctx *FmtCtx) {
-	switch boundary.BoundType {
+// Format implements the NodeFormatter interface.
+func (node *WindowFrameBound) Format(ctx *FmtCtx) {
+	switch node.BoundType {
 	case UnboundedPreceding:
 		ctx.WriteString("UNBOUNDED PRECEDING")
 	case ValuePreceding:
-		ctx.FormatNode(boundary.OffsetExpr)
+		ctx.FormatNode(node.OffsetExpr)
 		ctx.WriteString(" PRECEDING")
 	case CurrentRow:
 		ctx.WriteString("CURRENT ROW")
 	case ValueFollowing:
-		ctx.FormatNode(boundary.OffsetExpr)
+		ctx.FormatNode(node.OffsetExpr)
 		ctx.WriteString(" FOLLOWING")
 	case UnboundedFollowing:
 		ctx.WriteString("UNBOUNDED FOLLOWING")
 	default:
-		panic("unexpected WindowFrameBoundType")
+		panic(fmt.Sprintf("unhandled case: %d", node.BoundType))
 	}
 }
 
 // Format implements the NodeFormatter interface.
-func (wf *WindowFrame) Format(ctx *FmtCtx) {
-	switch wf.Mode {
+func (node *WindowFrame) Format(ctx *FmtCtx) {
+	switch node.Mode {
 	case RANGE:
 		ctx.WriteString("RANGE ")
 	case ROWS:
 		ctx.WriteString("ROWS ")
 	default:
-		panic("unexpected WindowFrameMode")
+		panic(fmt.Sprintf("unhandled case: %d", node.Mode))
 	}
-	if wf.Bounds.EndBound != nil {
+	if node.Bounds.EndBound != nil {
 		ctx.WriteString("BETWEEN ")
-		wf.Bounds.StartBound.write(ctx)
+		ctx.FormatNode(node.Bounds.StartBound)
 		ctx.WriteString(" AND ")
-		wf.Bounds.EndBound.write(ctx)
+		ctx.FormatNode(node.Bounds.EndBound)
 	} else {
-		wf.Bounds.StartBound.write(ctx)
+		ctx.FormatNode(node.Bounds.StartBound)
 	}
-}
-
-// Copy returns a deep copy of wf.
-func (wf *WindowFrame) Copy() *WindowFrame {
-	frameCopy := &WindowFrame{Mode: wf.Mode}
-	startBoundCopy := *wf.Bounds.StartBound
-	frameCopy.Bounds = WindowFrameBounds{&startBoundCopy, nil}
-	if wf.Bounds.EndBound != nil {
-		endBoundCopy := *wf.Bounds.EndBound
-		frameCopy.Bounds.EndBound = &endBoundCopy
-	}
-	return frameCopy
 }

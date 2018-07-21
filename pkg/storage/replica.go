@@ -58,6 +58,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -548,7 +549,11 @@ func (r *Replica) withRaftGroupLocked(
 		}
 	}
 
-	unquiesce, err := f(r.mu.internalRaftGroup)
+	// This wrapper function is a hack to add range IDs to stack traces
+	// using the same pattern as Replica.sendWithRangeID.
+	unquiesce, err := func(rangeID roachpb.RangeID, raftGroup *raft.RawNode) (bool, error) {
+		return f(raftGroup)
+	}(r.RangeID, r.mu.internalRaftGroup)
 	if unquiesce {
 		r.unquiesceAndWakeLeaderLocked()
 	}
@@ -1134,11 +1139,7 @@ func (r *Replica) updateProposalQuotaRaftMuLocked(
 	for _, rep := range r.mu.state.Desc.Replicas {
 		// Only consider followers that that have "healthy" RPC connections.
 
-		addr, err := r.store.cfg.Transport.resolver(rep.NodeID)
-		if err != nil {
-			continue
-		}
-		if err := r.store.cfg.Transport.rpcContext.ConnHealth(addr.String()); err != nil {
+		if err := r.store.cfg.NodeDialer.ConnHealth(rep.NodeID); err != nil {
 			continue
 		}
 
@@ -1556,6 +1557,10 @@ func (r *Replica) Desc() *roachpb.RangeDescriptor {
 	return r.mu.state.Desc
 }
 
+func (r *Replica) descRLocked() *roachpb.RangeDescriptor {
+	return r.mu.state.Desc
+}
+
 // NodeID returns the ID of the node this replica belongs to.
 func (r *Replica) NodeID() roachpb.NodeID {
 	return r.store.nodeDesc.NodeID
@@ -1720,6 +1725,13 @@ func (r *Replica) getReplicaDescriptorRLocked() (roachpb.ReplicaDescriptor, erro
 		return repDesc, nil
 	}
 	return roachpb.ReplicaDescriptor{}, roachpb.NewRangeNotFoundError(r.RangeID)
+}
+
+func (r *Replica) getMergeCompleteCh() chan struct{} {
+	r.mu.RLock()
+	mergeCompleteCh := r.mu.mergeComplete
+	r.mu.RUnlock()
+	return mergeCompleteCh
 }
 
 // setLastReplicaDescriptors sets the the most recently seen replica
@@ -1911,6 +1923,23 @@ func (r *Replica) maybeInitializeRaftGroup(ctx context.Context) {
 // ctx should contain the log tags from the store (and up).
 func (r *Replica) Send(
 	ctx context.Context, ba roachpb.BatchRequest,
+) (*roachpb.BatchResponse, *roachpb.Error) {
+	return r.sendWithRangeID(ctx, r.RangeID, ba)
+}
+
+// sendWithRangeID takes an unused rangeID argument so that the range
+// ID will be accessible in stack traces (both in panics and when
+// sampling goroutines from a live server). This line is subject to
+// the whims of the compiler and it can be difficult to find the right
+// value, but as of this writing the following example shows a stack
+// while processing range 21 (0x15) (the first occurrence of that
+// number is the rangeID argument, the second is within the encoded
+// BatchRequest, although we don't want to rely on that occurring
+// within the portion printed in the stack trace):
+//
+// github.com/cockroachdb/cockroach/pkg/storage.(*Replica).sendWithRangeID(0xc420d1a000, 0x64bfb80, 0xc421564b10, 0x15, 0x153fd4634aeb0193, 0x0, 0x100000001, 0x1, 0x15, 0x0, ...)
+func (r *Replica) sendWithRangeID(
+	ctx context.Context, rangeID roachpb.RangeID, ba roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
 	var br *roachpb.BatchResponse
 	if r.leaseholderStats != nil && ba.Header.GatewayNodeID != 0 {
@@ -2197,9 +2226,6 @@ func collectSpans(
 
 	for _, union := range ba.Requests {
 		inner := union.GetInner()
-		if _, ok := inner.(*roachpb.NoopRequest); ok {
-			continue
-		}
 		if cmd, ok := batcheval.LookupCommand(inner.Method()); ok {
 			cmd.DeclareKeys(desc, ba.Header, inner, spans)
 		} else {
@@ -2343,10 +2369,7 @@ func (r *Replica) beginCmds(
 			fn(ba, storagebase.CommandQueueBeginExecuting)
 		}
 
-		r.mu.Lock()
-		mergeCompleteCh := r.mu.mergeComplete
-		r.mu.Unlock()
-		if mergeCompleteCh != nil {
+		if r.getMergeCompleteCh() != nil && !ba.IsSingleGetSnapshotForMergeRequest() {
 			// The replica is being merged into its left-hand neighbor. This request
 			// cannot proceed until the merge completes, signaled by the closing of
 			// the channel.
@@ -2356,14 +2379,45 @@ func (r *Replica) beginCmds(
 			// guaranteed that we're not racing with a GetSnapshotForMerge command.
 			// (GetSnapshotForMerge commands declare a conflict with all other
 			// commands.)
-			select {
-			case <-mergeCompleteCh:
-				// Merge complete. Carry on.
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-r.store.stopper.ShouldQuiesce():
-				return nil, &roachpb.NodeUnavailableError{}
-			}
+			//
+			// Note that GetSnapshotForMerge commands are exempt from waiting on the
+			// mergeComplete channel. This is necessary to avoid deadlock. While
+			// normally a GetSnapshotForMerge request will trigger the installation of
+			// a mergeComplete channel after it is executed, it may sometimes execute
+			// after the mergeComplete channel has been installed. Consider the case
+			// where the RHS replica acquires a new lease after the merge transaction
+			// deletes its local range descriptor but before the GetSnapshotForMerge
+			// command is sent. The lease acquisition request will notice the intent
+			// on the local range descriptor and install a mergeComplete channel. If
+			// the forthcoming GetSnapshotForMerge blocked on that channel, the merge
+			// transaction would deadlock.
+			//
+			// This exclusion admits a small race condition. If a GetSnapshotForMerge
+			// request is sent to the right-hand side of a merge, outside of a merge
+			// transaction, after the merge has committed but before the RHS has
+			// noticed that the merge has committed, the request may return stale
+			// data. Since the merge has committed, the LHS may have processed writes
+			// to the keyspace previously owned by the RHS that the RHS is unaware of.
+			// This window closes quickly, as the RHS will soon notice the merge
+			// transaction has committed and mark itself as destroyed, which prevents
+			// it from serving all traffic, including GetSnapshotForMerge requests.
+			//
+			// In our current, careful usage of GetSnapshotForMerge, this race
+			// condition is irrelevant. GetSnapshotForMerge is only sent from within a
+			// merge transaction, and merge transactions read the RHS descriptor at
+			// the beginning of the transaction to verify that it has not already been
+			// merged away.
+			//
+			// We can't wait for the merge to complete here, though. The replica might
+			// need to respond to a GetSnapshotForMerge request in order for the merge
+			// to complete, and blocking here would force that GetSnapshotForMerge
+			// request to sit in the command queue forever, deadlocking the merge.
+			// Instead, we remove the commands from the command queue and return a
+			// MergeInProgressError. The store will catch that error and resubmit the
+			// request after mergeCompleteCh closes. See #27442 for the full context.
+			log.Event(ctx, "waiting on in-progress merge")
+			r.removeCmdsFromCommandQueue(newCmds)
+			return nil, &roachpb.MergeInProgressError{}
 		}
 	} else {
 		log.Event(ctx, "operation accepts inconsistent results")
@@ -2585,6 +2639,11 @@ func (r *Replica) executeAdminBatch(
 	if pErr != nil {
 		return nil, pErr
 	}
+
+	if ba.Header.ReturnRangeInfo {
+		returnRangeInfo(resp, r)
+	}
+
 	br := &roachpb.BatchResponse{}
 	br.Add(resp)
 	br.Txn = resp.Header().Txn
@@ -2649,8 +2708,6 @@ func (r *Replica) limitTxnMaxTimestamp(
 // maybeWatchForMerge checks whether a merge of this replica into its left
 // neighbor is in its critical phase and, if so, arranges to block all requests
 // until the merge completes.
-//
-// TODO(benesch): Ensure this is called in the lease acquisition path.
 func (r *Replica) maybeWatchForMerge(ctx context.Context) error {
 	desc := r.Desc()
 	descKey := keys.RangeDescriptorKey(desc.StartKey)
@@ -2679,15 +2736,16 @@ func (r *Replica) maybeWatchForMerge(ctx context.Context) error {
 	mergeCompleteCh := make(chan struct{})
 	r.mu.Lock()
 	if r.mu.mergeComplete != nil {
-		// TODO(benesch): Is there a way this could legitimately happen? If so,
-		// what to do? Return and assume there's another goroutine that's doing
-		// the watching?
-		log.Fatalf(ctx, "maybeWatchForMerge called twice for the same merge")
+		// Another request already noticed the merge, installed a mergeComplete
+		// channel, and launched a goroutine to watch for the merge's completion.
+		// Nothing more to do.
+		r.mu.Unlock()
+		return nil
 	}
 	r.mu.mergeComplete = mergeCompleteCh
 	r.mu.Unlock()
 
-	return r.store.stopper.RunAsyncTask(context.Background(), "wait-for-merge", func(ctx context.Context) {
+	err = r.store.stopper.RunAsyncTask(context.Background(), "wait-for-merge", func(ctx context.Context) {
 		rs, _, err := client.RangeLookup(ctx, r.DB().NonTransactionalSender(), desc.StartKey.AsRawKey(),
 			roachpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
 		if err != nil {
@@ -2731,6 +2789,15 @@ func (r *Replica) maybeWatchForMerge(ctx context.Context) error {
 		close(mergeCompleteCh)
 		r.mu.Unlock()
 	})
+	if err == stop.ErrUnavailable {
+		// We weren't able to launch a goroutine to watch for the merge's completion
+		// because the server is shutting down. Normally failing to launch the
+		// watcher goroutine would wedge pending requests on the replica's
+		// mergeComplete channel forever, but since we're shutting down those
+		// requests will get dropped and retried on another node. Suppress the error.
+		err = nil
+	}
+	return err
 }
 
 // executeReadOnlyBatch updates the read timestamp cache and waits for any
@@ -2798,7 +2865,7 @@ func (r *Replica) executeReadOnlyBatch(
 	defer readOnly.Close()
 	br, result, pErr = evaluateBatch(ctx, storagebase.CmdIDKey(""), readOnly, rec, nil, ba)
 
-	if result.Local.DetachSetMerging() {
+	if result.Local.DetachMaybeWatchForMerge() {
 		if err := r.maybeWatchForMerge(ctx); err != nil {
 			return nil, roachpb.NewError(err)
 		}
@@ -3170,6 +3237,17 @@ func (r *Replica) evaluateProposal(
 	// replication is not necessary.
 	res.Local.Reply = br
 
+	// Assert that successful write requests result in intents. This is
+	// important for transactional pipelining and the parallel commit proposal
+	// because both use the presence of an intent to indicate that a write
+	// succeeded. This check may have false negatives but will never have false
+	// positives.
+	if br.Txn != nil && br.Txn.Status != roachpb.ABORTED {
+		if ba.IsTransactionWrite() && !ba.IsRange() && batch.Empty() {
+			log.Fatalf(ctx, "successful transaction point write batch %v resulted in no-op", ba)
+		}
+	}
+
 	// needConsensus determines if the result needs to be replicated and
 	// proposed through Raft. This is necessary if at least one of the
 	// following conditions is true:
@@ -3327,6 +3405,10 @@ func (r *Replica) propose(
 	proposal, pErr := r.requestToProposal(ctx, idKey, ba, endCmds, spans)
 	log.Event(proposal.ctx, "evaluated request")
 
+	// Pull out proposal channel to return. proposal.doneCh may be set to
+	// nil if it is signaled in this function.
+	proposalCh := proposal.doneCh
+
 	// There are two cases where request evaluation does not lead to a Raft
 	// proposal:
 	// 1. proposal.command == nil indicates that the evaluation was a no-op
@@ -3345,7 +3427,35 @@ func (r *Replica) propose(
 			EndTxns: endTxns,
 		}
 		proposal.finishApplication(pr)
-		return proposal.doneCh, func() bool { return false }, nil
+		return proposalCh, func() bool { return false }, nil
+	}
+
+	// If the request requested that Raft consensus be performed asynchronously,
+	// return a proposal result immediately on the proposal's done channel.
+	// The channel's capacity will be large enough to accommodate this.
+	if ba.AsyncConsensus {
+		if ets := proposal.Local.DetachEndTxns(false /* alwaysOnly */); len(ets) != 0 {
+			// Disallow async consensus for commands with EndTxnIntents because
+			// any !Always EndTxnIntent can't be cleaned up until after the
+			// command succeeds.
+			return nil, nil, roachpb.NewErrorf("cannot perform consensus asynchronously for "+
+				"proposal with EndTxnIntents=%v; %v", ets, ba)
+		}
+
+		// Fork the proposal's context span so that the proposal's context
+		// can outlive the original proposer's context.
+		proposal.ctx, proposal.sp = tracing.ForkCtxSpan(ctx, "async consensus")
+
+		// Signal the proposal's response channel immediately.
+		reply := *proposal.Local.Reply
+		reply.Responses = append([]roachpb.ResponseUnion(nil), reply.Responses...)
+		pr := proposalResult{
+			Reply:   &reply,
+			Intents: proposal.Local.DetachIntents(),
+		}
+		proposal.signalProposalResult(pr)
+
+		// Continue with proposal...
 	}
 
 	// TODO(irfansharif): This int cast indicates that if someone configures a
@@ -3429,6 +3539,7 @@ func (r *Replica) propose(
 	} else if err != nil {
 		return nil, nil, roachpb.NewError(err)
 	}
+
 	// Must not use `proposal` in the closure below as a proposal which is not
 	// present in r.mu.proposals is no longer protected by the mutex. Abandoning
 	// a command only abandons the associated context. As soon as we propose a
@@ -3448,7 +3559,7 @@ func (r *Replica) propose(
 		r.mu.Unlock()
 		return ok
 	}
-	return proposal.doneCh, tryAbandon, nil
+	return proposalCh, tryAbandon, nil
 }
 
 // submitProposalLocked proposes or re-proposes a command in r.mu.proposals.
@@ -3585,6 +3696,12 @@ func (r *Replica) quiesceLocked() bool {
 		log.Infof(ctx, "already quiesced")
 	}
 	return true
+}
+
+func (r *Replica) unquiesce() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.unquiesceLocked()
 }
 
 func (r *Replica) unquiesceLocked() {
@@ -4065,7 +4182,7 @@ func fatalOnRaftReadyErr(ctx context.Context, expl string, err error) {
 
 // tick the Raft group, returning any error and true if the raft group exists
 // and false otherwise.
-func (r *Replica) tick() (bool, error) {
+func (r *Replica) tick(livenessMap map[roachpb.NodeID]bool) (bool, error) {
 	r.unreachablesMu.Lock()
 	remotes := r.unreachablesMu.remotes
 	r.unreachablesMu.remotes = nil
@@ -4089,7 +4206,7 @@ func (r *Replica) tick() (bool, error) {
 	if r.mu.quiescent {
 		return false, nil
 	}
-	if r.maybeQuiesceLocked() {
+	if r.maybeQuiesceLocked(livenessMap) {
 		return false, nil
 	}
 
@@ -4148,6 +4265,18 @@ func (r *Replica) tick() (bool, error) {
 // it will either still apply to the recipient or the recipient will have moved
 // forward and the quiesce message will fall back to being a heartbeat.
 //
+// The supplied livenessMap maps from node ID to a boolean indicating
+// liveness. A range may be quiesced in the presence of non-live
+// replicas if the remaining live replicas all meet the quiesce
+// requirements. When a node considered non-live becomes live, the
+// node liveness instance invokes a callback which causes all nodes to
+// wakes up any ranges containing replicas owned by the newly-live
+// node, allowing the out-of-date replicas to be brought back up to date.
+// If livenessMap is nil, liveness data will not be used, meaning no range
+// will quiesce if any replicas are behind, whether or not they are live.
+// If any entry in the livenessMap is nil, then the missing node ID is
+// treated as not live.
+//
 // TODO(peter): There remains a scenario in which a follower is left unquiesced
 // while the leader is quiesced: the follower's receive queue is full and the
 // "quiesce" message is dropped. This seems very very unlikely because if the
@@ -4155,17 +4284,9 @@ func (r *Replica) tick() (bool, error) {
 // would quiesce. The fallout from this situation are undesirable raft
 // elections which will cause throughput hiccups to the range, but not
 // correctness issues.
-//
-// TODO(peter): When a node goes down, any range which has a replica on the
-// down node will not quiesce. This could be a significant performance
-// impact. Additionally, when the node comes back up we want to bring any
-// replicas it contains back up to date. Right now this will be handled because
-// those ranges never quiesce. One thought for handling both these scenarios is
-// to hook into the StorePool and its notion of "down" nodes. But that might
-// not be sensitive enough.
-func (r *Replica) maybeQuiesceLocked() bool {
+func (r *Replica) maybeQuiesceLocked(livenessMap map[roachpb.NodeID]bool) bool {
 	ctx := r.AnnotateCtx(context.TODO())
-	status, ok := shouldReplicaQuiesce(ctx, r, r.store.Clock().Now(), len(r.mu.proposals))
+	status, ok := shouldReplicaQuiesce(ctx, r, r.store.Clock().Now(), len(r.mu.proposals), livenessMap)
 	if !ok {
 		return false
 	}
@@ -4173,6 +4294,7 @@ func (r *Replica) maybeQuiesceLocked() bool {
 }
 
 type quiescer interface {
+	descRLocked() *roachpb.RangeDescriptor
 	raftStatusRLocked() *raft.Status
 	raftLastIndexLocked() (uint64, error)
 	hasRaftReadyRLocked() bool
@@ -4204,7 +4326,11 @@ func (r *Replica) maybeTransferRaftLeader(
 // facilitate testing. Returns the raft.Status and true on success, and (nil,
 // false) on failure.
 func shouldReplicaQuiesce(
-	ctx context.Context, q quiescer, now hlc.Timestamp, numProposals int,
+	ctx context.Context,
+	q quiescer,
+	now hlc.Timestamp,
+	numProposals int,
+	livenessMap map[roachpb.NodeID]bool,
 ) (*raft.Status, bool) {
 	if numProposals != 0 {
 		if log.V(4) {
@@ -4269,15 +4395,30 @@ func shouldReplicaQuiesce(
 		}
 		return nil, false
 	}
+
 	var foundSelf bool
-	for id, progress := range status.Progress {
-		if id == status.ID {
+	for _, rep := range q.descRLocked().Replicas {
+		if uint64(rep.ReplicaID) == status.ID {
 			foundSelf = true
 		}
-		if progress.Match != status.Applied {
+		if progress, ok := status.Progress[uint64(rep.ReplicaID)]; !ok {
+			if log.V(4) {
+				log.Infof(ctx, "not quiescing: could not locate replica %d in progress: %+v",
+					rep.ReplicaID, progress)
+			}
+			return nil, false
+		} else if progress.Match != status.Applied {
+			// Skip any node in the descriptor which is not live.
+			if livenessMap != nil && !livenessMap[rep.NodeID] {
+				if log.V(4) {
+					log.Infof(ctx, "skipping node %d because not live. Progress=%+v",
+						rep.NodeID, progress)
+				}
+				continue
+			}
 			if log.V(4) {
 				log.Infof(ctx, "not quiescing: replica %d match (%d) != applied (%d)",
-					id, progress.Match, status.Applied)
+					rep.ReplicaID, progress.Match, status.Applied)
 			}
 			return nil, false
 		}
@@ -4310,8 +4451,20 @@ func (r *Replica) quiesceAndNotifyLocked(ctx context.Context, status *raft.Statu
 	if !r.quiesceLocked() {
 		return false
 	}
-	for id := range status.Progress {
+
+	for id, prog := range status.Progress {
 		if roachpb.ReplicaID(id) == r.mu.replicaID {
+			continue
+		}
+		// In common operation, we only quiesce when all followers are
+		// up-to-date. However, when we quiesce in the presence of dead
+		// nodes, a follower which is behind but considered dead may not
+		// have the log entry referenced by status.Commit and would
+		// explode if it were told to commit up to that point. So if
+		// prog.Match for a replica is not up to date with status.Commit,
+		// assume the replica is considered dead and skip the quiesce
+		// heartbeat.
+		if prog.Match < status.Commit {
 			continue
 		}
 		toReplica, toErr := r.getReplicaDescriptorByIDRLocked(
@@ -5644,7 +5797,11 @@ func optimizePuts(
 	if firstUnoptimizedIndex < optimizePutThreshold { // don't bother if below this threshold
 		return origReqs
 	}
-	iter := batch.NewIterator(engine.IterOptions{UpperBound: maxKey})
+	iter := batch.NewIterator(engine.IterOptions{
+		// We want to include maxKey in our scan. Since UpperBound is exclusive, we
+		// need to set it to the key after maxKey.
+		UpperBound: maxKey.Next(),
+	})
 	defer iter.Close()
 
 	// If there are enough puts in the run to justify calling seek,

@@ -81,7 +81,7 @@ type testSenderFactory struct {
 }
 
 func (f *testSenderFactory) TransactionalSender(
-	typ client.TxnType, _ *roachpb.Transaction,
+	typ client.TxnType, _ roachpb.TxnCoordMeta,
 ) client.TxnSender {
 	return &testSender{store: f.store}
 }
@@ -1097,27 +1097,6 @@ func TestStoreAnnotateNow(t *testing.T) {
 				test.check(store.TestSender().Send(context.Background(), ba))
 			}()
 		}
-	}
-}
-
-func TestStoreExecuteNoop(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
-	store, _ := createTestStore(t, stopper)
-	ba := roachpb.BatchRequest{}
-	ba.RangeID = 1
-	ba.Replica = roachpb.ReplicaDescriptor{StoreID: store.StoreID()}
-	ba.Add(&roachpb.GetRequest{RequestHeader: roachpb.RequestHeader{Key: roachpb.Key("a")}})
-	ba.Add(&roachpb.NoopRequest{})
-
-	br, pErr := store.Send(context.Background(), ba)
-	if pErr != nil {
-		t.Fatal(pErr)
-	}
-	reply := br.Responses[1].GetInner()
-	if _, ok := reply.(*roachpb.NoopResponse); !ok {
-		t.Errorf("expected *roachpb.NoopResponse, got %T", reply)
 	}
 }
 
@@ -3128,7 +3107,7 @@ func TestReserveSnapshotFullnessLimit(t *testing.T) {
 
 	ctx := context.Background()
 
-	desc, err := s.Descriptor()
+	desc, err := s.Descriptor(false /* useCached */)
 	if err != nil {
 		t.Fatal(err)
 	}

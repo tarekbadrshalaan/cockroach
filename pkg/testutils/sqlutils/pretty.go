@@ -15,7 +15,6 @@
 package sqlutils
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -27,18 +26,16 @@ import (
 func VerifyStatementPrettyRoundtrip(t *testing.T, sql string) {
 	t.Helper()
 
-	if strings.Contains(strings.ToUpper(sql), "AS OF SYSTEM TIME") {
-		// TODO(mjibson): See #26976
-		return
-	}
-
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("%s: %s", err, sql)
 	}
+	cfg := tree.DefaultPrettyCfg()
+	// Be careful to not simplify otherwise the tests won't round trip.
+	cfg.Simplify = false
 	for _, origStmt := range stmts {
 		// Be careful to not simplify otherwise the tests won't round trip.
-		prettyStmt := tree.PrettyWithOpts(origStmt, tree.DefaultPrettyWidth, true, 4, false /* simplify */)
+		prettyStmt := cfg.Pretty(origStmt)
 		parsedPretty, err := parser.ParseOne(prettyStmt)
 		if err != nil {
 			t.Fatalf("%s: %s", err, prettyStmt)

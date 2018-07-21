@@ -420,6 +420,17 @@ func (f *FuncDepSet) Empty() bool {
 	return len(f.deps) == 0 && !f.hasKey && f.key.Empty()
 }
 
+// ColSet returns all columns referenced by the FD set.
+func (f *FuncDepSet) ColSet() opt.ColSet {
+	var cols opt.ColSet
+	for i := 0; i < len(f.deps); i++ {
+		fd := &f.deps[i]
+		cols.UnionWith(fd.from)
+		cols.UnionWith(fd.to)
+	}
+	return cols
+}
+
 // HasMax1Row returns true if the relation has zero or one rows.
 func (f *FuncDepSet) HasMax1Row() bool {
 	return f.hasKey && f.key.Empty()
@@ -503,6 +514,12 @@ func (f *FuncDepSet) ReduceCols(cols opt.ColSet) opt.ColSet {
 		removed.Remove(i)
 	}
 	return cols
+}
+
+// InClosureOf returns true if the given columns are functionally determined by
+// the "in" column set.
+func (f *FuncDepSet) InClosureOf(cols, in opt.ColSet) bool {
+	return f.inClosureOf(cols, in, true /* strict */)
 }
 
 // ComputeClosure returns the strict closure of the given columns. The closure
@@ -923,9 +940,9 @@ func (f *FuncDepSet) AddFrom(fdset *FuncDepSet) {
 // expected to operate on disjoint columns, so the FDs from each are simply
 // concatenated, rather than simplified via calls to addDependency (except for
 // case of constant columns).
-func (f *FuncDepSet) MakeProduct(fdset *FuncDepSet) {
-	for i := range fdset.deps {
-		fd := &fdset.deps[i]
+func (f *FuncDepSet) MakeProduct(inner *FuncDepSet) {
+	for i := range inner.deps {
+		fd := &inner.deps[i]
 		if fd.from.Empty() {
 			f.addDependency(fd.from, fd.to, fd.strict, fd.equiv)
 		} else {
@@ -933,8 +950,8 @@ func (f *FuncDepSet) MakeProduct(fdset *FuncDepSet) {
 		}
 	}
 
-	if f.hasKey && fdset.hasKey {
-		f.setKey(f.key.Union(fdset.key))
+	if f.hasKey && inner.hasKey {
+		f.setKey(f.key.Union(inner.key))
 	} else {
 		f.ClearKey()
 	}
@@ -942,26 +959,45 @@ func (f *FuncDepSet) MakeProduct(fdset *FuncDepSet) {
 
 // MakeApply modifies the FD set to reflect the impact of an apply join. This
 // FD set reflects the properties of the outer query, and the given FD set
-// reflects the properties of the inner query. The logic is similar to
-// MakeProduct, except that constant dependencies introduced by MakeMax1Row
-// must be handled differently. For example:
+// reflects the properties of the inner query. Constant FDs from inner set no
+// longer hold and some other dependencies need to be augmented in order to be
+// valid for the apply join operator. Consider this example:
 //
 //   SELECT *
 //   FROM a
-//   INNER JOIN LATERAL (SELECT COUNT(*) FROM b WHERE b.x=a.x)
+//   INNER JOIN LATERAL (SELECT * FROM b WHERE b.y=a.y)
 //   ON True
 //
-// Although the right input to the join produces one row, it can have a
-// different value for each row of the outer relation. This invalidates its
-// constant dependencies.
-func (f *FuncDepSet) MakeApply(fdset *FuncDepSet) {
-	if fdset.HasMax1Row() {
-		if f.hasKey {
-			cols := fdset.ComputeClosure(fdset.key)
-			f.addDependency(f.key, cols, true /* strict */, false /* equiv */)
+// 1. The constant dependency created from the outer column reference b.y=a.y
+//    does not hold for the Apply operator, since b.y is no longer constant at
+//    this level. In general, constant dependencies cannot be retained, because
+//    they may have been generated from outer column equivalencies.
+// 2. If a strict dependency (b.x,b.y)-->(b.z) held, it would have been reduced
+//    to (b.x)-->(b.z) because (b.y) is constant in the inner query. However,
+//    (b.x)-->(b.z) does not hold for the Apply operator, since (b.y) is not
+//    constant in that case. However, the dependency *does* hold as long as its
+//    determinant is augmented by the left input's key columns (if key exists).
+// 3. Lax dependencies follow the same rules as #2.
+// 4. Equivalence dependencies in the inner query still hold for the Apply
+//    operator.
+// 5. If both the outer and inner inputs of the apply join have keys, then the
+//    concatenation of those keys is a key on the apply join result.
+//
+func (f *FuncDepSet) MakeApply(inner *FuncDepSet) {
+	for i := range inner.deps {
+		fd := &inner.deps[i]
+		if fd.equiv {
+			f.addDependency(fd.from, fd.to, fd.strict, fd.equiv)
+		} else if !fd.from.Empty() && f.hasKey {
+			f.addDependency(f.key.Union(fd.from), fd.to, fd.strict, fd.equiv)
 		}
+	}
+
+	if f.hasKey && inner.hasKey {
+		f.setKey(f.key.Union(inner.key))
+		f.ensureKeyClosure(inner.ColSet())
 	} else {
-		f.MakeProduct(fdset)
+		f.ClearKey()
 	}
 }
 
@@ -970,20 +1006,18 @@ func (f *FuncDepSet) MakeApply(fdset *FuncDepSet) {
 // cartesian product + ON filtering, and an outer join is modeled as an inner
 // join + union of NULL-extended rows. MakeOuter performs the final step, given
 // the set of columns that will be null-extended (i.e. columns from the
-// null-providing side(s) of the join), as well as the set of all not null
-// columns in the relation (from both sides of join).
+// null-providing side(s) of the join), as well as the set of input columns from
+// both sides of the join that are not null.
 //
 // See the "Left outer join" section on page 84 of the Master's Thesis for
 // the impact of outer joins on FDs.
 func (f *FuncDepSet) MakeOuter(nullExtendedCols, notNullCols opt.ColSet) {
 	var newFDs []funcDep
-	var allCols opt.ColSet
+	allCols := f.ColSet()
 
 	n := 0
 	for i := range f.deps {
 		fd := &f.deps[i]
-		allCols.UnionWith(fd.from)
-		allCols.UnionWith(fd.to)
 
 		if fd.from.Empty() {
 			// Null-extended constant dependency becomes lax (i.e. it may be either
@@ -1030,26 +1064,34 @@ func (f *FuncDepSet) MakeOuter(nullExtendedCols, notNullCols opt.ColSet) {
 			//    the determinant, such as (c,d)-->(e), then the (NULL,NULL)
 			//    determinant will be unique, thus preserving a strict FD.
 			//
+			// 3. A dependency with determinant columns drawn from both sides of
+			//    the join is discarded, unless the determinant is a key for the
+			//    relation. Null-extending one side of the join does not disturb
+			//    the relation's keys, and keys always determine all other columns.
+			//
 			if fd.from.Intersects(nullExtendedCols) {
 				if !fd.from.SubsetOf(nullExtendedCols) {
-					panic(fmt.Sprintf("determinant cannot contain columns from both sides of join: %s", f))
-				}
-
-				// Rule #1, described above (determinant is on null-supplying side).
-				if !fd.to.SubsetOf(nullExtendedCols) {
-					// Split the dependants by which side of the join they're on.
-					laxCols := fd.to.Difference(nullExtendedCols)
-					newFDs = append(newFDs, funcDep{from: fd.from, to: laxCols})
-					if !fd.removeToCols(laxCols) {
+					// Rule #3, described above.
+					if !f.ColsAreStrictKey(fd.from) {
 						continue
 					}
-				}
+				} else {
+					// Rule #1, described above (determinant is on null-supplying side).
+					if !fd.to.SubsetOf(nullExtendedCols) {
+						// Split the dependants by which side of the join they're on.
+						laxCols := fd.to.Difference(nullExtendedCols)
+						newFDs = append(newFDs, funcDep{from: fd.from, to: laxCols})
+						if !fd.removeToCols(laxCols) {
+							continue
+						}
+					}
 
-				// Rule #2, described above. Note that this rule does not apply to
-				// equivalence FDs, which remain valid.
-				if fd.strict && !fd.equiv && !fd.from.Intersects(notNullCols) {
-					newFDs = append(newFDs, funcDep{from: fd.from, to: fd.to})
-					continue
+					// Rule #2, described above. Note that this rule does not apply to
+					// equivalence FDs, which remain valid.
+					if fd.strict && !fd.equiv && !fd.from.Intersects(notNullCols) {
+						newFDs = append(newFDs, funcDep{from: fd.from, to: fd.to})
+						continue
+					}
 				}
 			} else {
 				// Rule #1, described above (determinant is on row-supplying side).
@@ -1106,11 +1148,8 @@ func (f *FuncDepSet) ensureKeyClosure(cols opt.ColSet) {
 //   8. If FD set has no key then key columns should be empty.
 //
 func (f *FuncDepSet) Verify() {
-	var allCols opt.ColSet
 	for i := range f.deps {
 		fd := &f.deps[i]
-		allCols.UnionWith(fd.from)
-		allCols.UnionWith(fd.to)
 
 		if fd.from.Intersects(fd.to) {
 			panic(fmt.Sprintf("expected FD determinant and dependants to be disjoint: %s (%d)", f, i))
@@ -1142,6 +1181,7 @@ func (f *FuncDepSet) Verify() {
 			panic(fmt.Sprintf("expected FD to have candidate key: %s", f))
 		}
 
+		allCols := f.ColSet()
 		allCols.UnionWith(f.key)
 		if !f.ComputeClosure(f.key).Equals(allCols) {
 			panic(fmt.Sprintf("expected closure of FD key to include all known cols: %s", f))

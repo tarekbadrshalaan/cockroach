@@ -15,9 +15,12 @@
 package xform
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 // canProvidePhysicalProps returns true if the given expression can provide the
@@ -81,10 +84,10 @@ func (o *Optimizer) canProvideOrdering(eid memo.ExprID, required *props.Ordering
 		// depends only on columns present in the input.
 		return o.isOrderingBoundBy(required, mexpr.AsProject().Input())
 
-	case opt.IndexJoinOp:
-		// Index Join operators can pass through their ordering if the ordering
-		// depends only on columns present in the input.
-		return o.isOrderingBoundBy(required, mexpr.AsIndexJoin().Input())
+	case opt.IndexJoinOp, opt.LookupJoinOp:
+		// Index and Lookup Join operators can pass through their ordering if the
+		// ordering depends only on columns present in the input.
+		return o.isOrderingBoundBy(required, mexpr.ChildGroup(o.mem, 0))
 
 	case opt.ScanOp:
 		// Scan naturally orders according to the order of the scanned index.
@@ -124,7 +127,8 @@ func (o *Optimizer) buildChildPhysicalProps(
 		switch mexpr.Operator() {
 		case opt.LimitOp, opt.OffsetOp,
 			opt.ExplainOp,
-			opt.RowNumberOp, opt.GroupByOp,
+			opt.RowNumberOp,
+			opt.GroupByOp, opt.ScalarGroupByOp,
 			opt.MergeJoinOp:
 			// These operations can require an ordering of some child even if there is
 			// no ordering requirement on themselves.
@@ -142,20 +146,26 @@ func (o *Optimizer) buildChildPhysicalProps(
 
 	// Ordering property.
 	switch mexpr.Operator() {
-	case opt.ProjectOp:
+	case opt.SelectOp:
 		if nth == 0 {
 			childProps.Ordering = parentProps.Ordering
-			o.optimizeProjectOrdering(mexpr.AsProject(), &childProps)
 		}
-
-	case opt.SelectOp, opt.IndexJoinOp:
+	case opt.ProjectOp, opt.IndexJoinOp, opt.LookupJoinOp:
 		if nth == 0 {
-			// Pass through the ordering.
 			childProps.Ordering = parentProps.Ordering
+			if mexpr.Operator() == opt.ProjectOp {
+				o.optimizeProjectOrdering(mexpr.AsProject(), &childProps)
+			}
+			childLogicalProps := o.mem.GroupProperties(mexpr.ChildGroup(o.mem, nth))
+			childOutCols := childLogicalProps.Relational.OutputCols
+			if !childProps.Ordering.SubsetOfCols(childOutCols) {
+				childProps.Ordering = childProps.Ordering.Copy()
+				childProps.Ordering.ProjectCols(childOutCols)
+			}
 		}
 
-	case opt.LimitOp, opt.OffsetOp, opt.RowNumberOp:
-		// Limit/Offset/RowNumber require the ordering in their private.
+	case opt.LimitOp, opt.OffsetOp, opt.RowNumberOp, opt.GroupByOp, opt.ScalarGroupByOp:
+		// These ops require the ordering in their private.
 		if nth == 0 {
 			var ordering *props.OrderingChoice
 			switch mexpr.Operator() {
@@ -166,14 +176,11 @@ func (o *Optimizer) buildChildPhysicalProps(
 			case opt.RowNumberOp:
 				def := o.mem.LookupPrivate(mexpr.AsRowNumber().Def()).(*memo.RowNumberDef)
 				ordering = &def.Ordering
+			case opt.GroupByOp, opt.ScalarGroupByOp:
+				def := mexpr.Private(o.mem).(*memo.GroupByDef)
+				ordering = &def.Ordering
 			}
 			childProps.Ordering = *ordering
-		}
-
-	case opt.GroupByOp:
-		if nth == 0 {
-			def := mexpr.Private(o.mem).(*memo.GroupByDef)
-			childProps.Ordering = def.Ordering
 		}
 
 	case opt.ExplainOp:
@@ -186,15 +193,24 @@ func (o *Optimizer) buildChildPhysicalProps(
 			mergeOn := o.mem.NormExpr(mexpr.AsMergeJoin().MergeOn())
 			def := o.mem.LookupPrivate(mergeOn.AsMergeOn().Def()).(*memo.MergeOnDef)
 			if nth == 0 {
-				childProps.Ordering = def.LeftEq
+				childProps.Ordering = def.LeftOrdering
 			} else {
-				childProps.Ordering = def.RightEq
+				childProps.Ordering = def.RightOrdering
 			}
 		}
 		// ************************* WARNING *************************
 		//  If you add a new case here, check if it needs to be added
 		//     to the exception list in the fast path above.
 		// ************************* WARNING *************************
+	}
+
+	// RaceEnabled ensures that checks are run on every change (as part of make
+	// testrace) while keeping the check code out of non-test builds.
+	if util.RaceEnabled && !childProps.Ordering.Any() {
+		props := o.mem.GroupProperties(mexpr.ChildGroup(o.mem, nth))
+		if !childProps.Ordering.SubsetOfCols(props.Relational.OutputCols) {
+			panic(fmt.Sprintf("OrderingChoice refers to non-output columns (op: %s)", mexpr.Operator()))
+		}
 	}
 
 	// If properties haven't changed, no need to re-intern them.
@@ -209,7 +225,7 @@ func (o *Optimizer) buildChildPhysicalProps(
 // in ordering.
 func (o *Optimizer) isOrderingBoundBy(ordering *props.OrderingChoice, input memo.GroupID) bool {
 	inputCols := o.mem.GroupProperties(input).Relational.OutputCols
-	return ordering.SubsetOfCols(inputCols)
+	return ordering.CanProjectCols(inputCols)
 }
 
 func (o *Optimizer) optimizeProjectOrdering(project *memo.ProjectExpr, physical *props.Physical) {

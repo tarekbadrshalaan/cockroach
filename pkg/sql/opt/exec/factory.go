@@ -68,6 +68,11 @@ type Factory interface {
 		reqOrder sqlbase.ColumnOrdering,
 	) (Node, error)
 
+	// ConstructVirtualScan returns a node that represents the scan of a virtual
+	// table. Virtual tables are system tables that are populated "on the fly"
+	// with rows synthesized from system metadata and other state.
+	ConstructVirtualScan(table opt.Table) (Node, error)
+
 	// ConstructFilter returns a node that applies a filter on the results of
 	// the given input node.
 	ConstructFilter(n Node, filter tree.TypedExpr) (Node, error)
@@ -101,10 +106,14 @@ type Factory interface {
 		leftOrdering, rightOrdering sqlbase.ColumnOrdering,
 	) (Node, error)
 
-	// ConstructGroupBy returns a node that runs an aggregation. If group columns
-	// are specified, a set of aggregations is performed for each group of values
-	// on those columns (otherwise there is a single group).
+	// ConstructGroupBy returns a node that runs an aggregation. A set of
+	// aggregations is performed for each group of values on the groupCols.
 	ConstructGroupBy(input Node, groupCols []ColumnOrdinal, aggregations []AggInfo) (Node, error)
+
+	// ConstructScalarGroupBy returns a node that runs a scalar aggregation, i.e.
+	// one which performs a set of aggregations on all the input rows (as a single
+	// group) and has exactly one result row (even when there are no input rows).
+	ConstructScalarGroupBy(input Node, aggregations []AggInfo) (Node, error)
 
 	// ConstructSetOp returns a node that performs a UNION / INTERSECT / EXCEPT
 	// operation (either the ALL or the DISTINCT version). The left and right
@@ -126,10 +135,33 @@ type Factory interface {
 		input Node, table opt.Table, cols ColumnOrdinalSet, reqOrder sqlbase.ColumnOrdering,
 	) (Node, error)
 
+	// ConstructLookupJoin returns a node that preforms a lookup join.
+	// The keyCols are columns from the input used as keys for the columns of the
+	// index (or a prefix of them); lookupCols are ordinals for the table columns
+	// we are retrieving.
+	//
+	// The node produces the columns in the input and lookupCols (ordered by
+	// ordinal). The ON condition can refer to these using IndexedVars.
+	ConstructLookupJoin(
+		joinType sqlbase.JoinType,
+		input Node,
+		table opt.Table,
+		index opt.Index,
+		keyCols []ColumnOrdinal,
+		lookupCols ColumnOrdinalSet,
+		onCond tree.TypedExpr,
+		reqOrder sqlbase.ColumnOrdering,
+	) (Node, error)
+
 	// ConstructLimit returns a node that implements LIMIT and/or OFFSET on the
 	// results of the given node. If one or the other is not needed, then it is
 	// set to nil.
 	ConstructLimit(input Node, limit, offset tree.TypedExpr) (Node, error)
+
+	// ConstructProjectSet returns a node that performs a lateral cross join
+	// between the output of the given node and the functional zip of the given
+	// expressions.
+	ConstructProjectSet(n Node, exprs tree.TypedExprs, cols sqlbase.ResultColumns) (Node, error)
 
 	// RenameColumns modifies the column names of a node.
 	RenameColumns(input Node, colNames []string) (Node, error)

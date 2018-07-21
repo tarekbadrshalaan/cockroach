@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xfunc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 )
 
 // NeededCols returns the set of columns needed by the given group. It is an
@@ -45,7 +46,8 @@ func (c *CustomFuncs) NeededCols3(group1, group2, group3 memo.GroupID) opt.ColSe
 func (c *CustomFuncs) NeededColsGroupBy(aggs memo.GroupID, def memo.PrivateID) opt.ColSet {
 	groupByDef := c.f.mem.LookupPrivate(def).(*memo.GroupByDef)
 	colSet := groupByDef.GroupingCols.Union(groupByDef.Ordering.ColSet())
-	return c.OuterCols(aggs).Union(colSet)
+	colSet.UnionWith(c.OuterCols(aggs))
+	return colSet
 }
 
 // NeededColsLimit unions the columns needed by Projections with the columns in
@@ -175,22 +177,62 @@ func (c *CustomFuncs) pruneValuesCols(values memo.GroupID, neededCols opt.ColSet
 	newElems := xfunc.MakeListBuilder(&c.CustomFuncs)
 
 	for _, row := range existingRows {
-		existingElems := c.f.mem.LookupList(c.f.mem.NormExpr(row).AsTuple().Elems())
+		tuple := c.f.mem.NormExpr(row).AsTuple()
+		existingElems := c.f.mem.LookupList(tuple.Elems())
+		typ := c.ExtractType(tuple.Typ()).(types.TTuple)
 
 		n := 0
 		for i, elem := range existingElems {
 			if !neededCols.Contains(int(existingCols[i])) {
 				continue
 			}
+			if i != n {
+				typ.Types[n] = typ.Types[i]
+			}
 
 			newElems.AddItem(elem)
 			n++
 		}
+		typ.Types = typ.Types[:n]
 
-		newRows.AddItem(c.f.ConstructTuple(newElems.BuildList()))
+		newRows.AddItem(c.f.ConstructTuple(newElems.BuildList(), c.f.InternType(typ)))
 	}
 
 	return c.f.ConstructValues(newRows.BuildList(), c.f.InternColList(newCols))
+}
+
+// PruneOrderingGroupBy removes any columns referenced by the Ordering inside
+// a GroupByDef which are not output columns of the given group (variant of
+// PruneOrdering).
+func (c *CustomFuncs) PruneOrderingGroupBy(
+	group memo.GroupID, private memo.PrivateID,
+) memo.PrivateID {
+	outCols := c.OutputCols(group)
+	def := c.f.mem.LookupPrivate(private).(*memo.GroupByDef)
+	if def.Ordering.SubsetOfCols(outCols) {
+		return private
+	}
+	defCopy := *def
+	defCopy.Ordering = defCopy.Ordering.Copy()
+	defCopy.Ordering.ProjectCols(outCols)
+	return c.f.InternGroupByDef(&defCopy)
+}
+
+// PruneOrderingRowNumber removes any columns referenced by the Ordering inside
+// a RowNumberDef which are not output columns of the given group (variant of
+// PruneOrdering).
+func (c *CustomFuncs) PruneOrderingRowNumber(
+	group memo.GroupID, private memo.PrivateID,
+) memo.PrivateID {
+	outCols := c.OutputCols(group)
+	def := c.f.mem.LookupPrivate(private).(*memo.RowNumberDef)
+	if def.Ordering.SubsetOfCols(outCols) {
+		return private
+	}
+	defCopy := *def
+	defCopy.Ordering = defCopy.Ordering.Copy()
+	defCopy.Ordering.ProjectCols(outCols)
+	return c.f.InternRowNumberDef(&defCopy)
 }
 
 // filterColList removes columns not in colWhitelist from a list of groups and

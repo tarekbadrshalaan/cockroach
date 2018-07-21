@@ -1449,6 +1449,21 @@ func TestRangeInfo(t *testing.T) {
 		t.Errorf("on put reply, expected %+v; got %+v", expRangeInfos, reply.Header().RangeInfos)
 	}
 
+	// Verify range info on an admin request.
+	adminArgs := &roachpb.AdminTransferLeaseRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key: splitKey.AsRawKey(),
+		},
+		Target: rhsLease.Replica.StoreID,
+	}
+	reply, pErr = client.SendWrappedWith(context.Background(), mtc.distSenders[0], h, adminArgs)
+	if pErr != nil {
+		t.Fatal(pErr)
+	}
+	if !reflect.DeepEqual(reply.Header().RangeInfos, expRangeInfos) {
+		t.Errorf("on admin reply, expected %+v; got %+v", expRangeInfos, reply.Header().RangeInfos)
+	}
+
 	// Verify multiple range infos on a scan request.
 	scanArgs := roachpb.ScanRequest{
 		RequestHeader: roachpb.RequestHeader{
@@ -1594,7 +1609,7 @@ func TestCampaignOnLazyRaftGroupInitialization(t *testing.T) {
 			desc: "past idle replica campaign timeout",
 			prepFn: func(t *testing.T) {
 				for _, s := range mtc.stores {
-					if err := s.GossipStore(context.TODO()); err != nil {
+					if err := s.GossipStore(context.TODO(), false /* useCached */); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -1608,7 +1623,7 @@ func TestCampaignOnLazyRaftGroupInitialization(t *testing.T) {
 			desc: "lease expired all replicas should campaign",
 			prepFn: func(t *testing.T) {
 				for _, s := range mtc.stores {
-					if err := s.GossipStore(context.TODO()); err != nil {
+					if err := s.GossipStore(context.TODO(), false /* useCached */); err != nil {
 						t.Fatal(err)
 					}
 				}

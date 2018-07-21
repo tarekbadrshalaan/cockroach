@@ -271,6 +271,10 @@ type planTop struct {
 	// #10028 is addressed.
 	hasStar bool
 
+	// isCorrelated collects whether the query was found to be correlated.
+	// Used to produce better error messages.
+	isCorrelated bool
+
 	// subqueryPlans contains all the sub-query plans.
 	subqueryPlans []subquery
 
@@ -293,6 +297,8 @@ type planTop struct {
 func (p *planner) makePlan(ctx context.Context, stmt Statement) error {
 	// Reinitialize.
 	p.curPlan = planTop{AST: stmt.AST}
+
+	log.VEvent(ctx, 1, "heuristic planner starts")
 
 	var err error
 	p.curPlan.plan, err = p.newPlan(ctx, stmt.AST, nil /*desiredTypes*/)
@@ -321,12 +327,16 @@ func (p *planner) makePlan(ctx context.Context, stmt Statement) error {
 		return err
 	}
 
+	log.VEvent(ctx, 1, "heuristic planner optimizes plan")
+
 	needed := allColumns(p.curPlan.plan)
 	p.curPlan.plan, err = p.optimizePlan(ctx, p.curPlan.plan, needed)
 	if err != nil {
 		p.curPlan.close(ctx)
 		return err
 	}
+
+	log.VEvent(ctx, 1, "heuristic planner optimizes subqueries")
 
 	// Now do the same work for all sub-queries.
 	for i := range p.curPlan.subqueryPlans {
@@ -347,6 +357,10 @@ func (p *planner) makePlan(ctx context.Context, stmt Statement) error {
 // makeOptimizerPlan is an alternative to makePlan which uses the (experimental)
 // optimizer.
 func (p *planner) makeOptimizerPlan(ctx context.Context, stmt Statement) error {
+	// Ensure that p.curPlan is populated in case an error occurs early,
+	// so that maybeLogStatement in the error case does not find an empty AST.
+	p.curPlan = planTop{AST: stmt.AST}
+
 	// Start with fast check to see if top-level statement is supported.
 	switch stmt.AST.(type) {
 	case *tree.ParenSelect, *tree.Select, *tree.SelectClause,
@@ -362,20 +376,42 @@ func (p *planner) makeOptimizerPlan(ctx context.Context, stmt Statement) error {
 	o := xform.NewOptimizer(p.EvalContext())
 	bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), &catalog, o.Factory(), stmt.AST)
 	root, props, err := bld.Build()
+
+	// Remember whether the plan was correlated before processing the
+	// error. This way, the executor will abort early with a useful error message instead of trying
+	// the heuristic planner.
+	p.curPlan.isCorrelated = bld.IsCorrelated
+
 	if err != nil {
 		return err
 	}
 
+	// If in the PREPARE phase, construct a dummy plan that has correct output
+	// columns. Only output columns and placeholder types are needed.
+	if p.extendedEvalCtx.PrepareOnly {
+		md := o.Memo().Metadata()
+		resultCols := make(sqlbase.ResultColumns, len(props.Presentation))
+		for i, col := range props.Presentation {
+			resultCols[i].Name = col.Label
+			resultCols[i].Typ = md.ColumnType(col.ID)
+		}
+		p.curPlan.plan = &zeroNode{columns: resultCols}
+		return nil
+	}
+
 	ev := o.Optimize(root, props)
 
-	factory := makeExecFactory(p)
+	factory := makeExecFactory(ctx, p)
 	plan, err := execbuilder.New(&factory, ev).Build()
 	if err != nil {
 		return err
 	}
 
 	p.curPlan = *plan.(*planTop)
+	// Since the assignment above just cleared the AST and isCorrelated
+	// field, we need to set them again.
 	p.curPlan.AST = stmt.AST
+	p.curPlan.isCorrelated = bld.IsCorrelated
 
 	cols := planColumns(p.curPlan.plan)
 	if stmt.ExpectedTypes != nil {
@@ -744,12 +780,8 @@ func (p *planner) newPlan(
 		return p.ShowColumns(ctx, n)
 	case *tree.ShowConstraints:
 		return p.ShowConstraints(ctx, n)
-	case *tree.ShowCreateTable:
-		return p.ShowCreateTable(ctx, n)
-	case *tree.ShowCreateView:
-		return p.ShowCreateView(ctx, n)
-	case *tree.ShowCreateSequence:
-		return p.ShowCreateSequence(ctx, n)
+	case *tree.ShowCreate:
+		return p.ShowCreate(ctx, n)
 	case *tree.ShowDatabases:
 		return p.ShowDatabases(ctx, n)
 	case *tree.ShowGrants:
@@ -867,12 +899,8 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 		return p.ShowClusterSetting(ctx, n)
 	case *tree.ShowVar:
 		return p.ShowVar(ctx, n)
-	case *tree.ShowCreateTable:
-		return p.ShowCreateTable(ctx, n)
-	case *tree.ShowCreateView:
-		return p.ShowCreateView(ctx, n)
-	case *tree.ShowCreateSequence:
-		return p.ShowCreateSequence(ctx, n)
+	case *tree.ShowCreate:
+		return p.ShowCreate(ctx, n)
 	case *tree.ShowColumns:
 		return p.ShowColumns(ctx, n)
 	case *tree.ShowDatabases:

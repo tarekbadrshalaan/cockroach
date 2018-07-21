@@ -61,13 +61,6 @@ type Builder struct {
 	// constraints).
 	AllowImpureFuncs bool
 
-	// AllowBlacklistOps is a control knob: if set, when building a scalar, if a
-	// given operator is marked as blacklisted for the optimizer, it will be let
-	// through anyway. This is used in cases where we want to use the opt code to
-	// build constraints when using the heuristic planner, but we don't want to
-	// plan such queries using the optimizer.
-	AllowBlacklistOps bool
-
 	// FmtFlags controls the way column names are formatted in test output. For
 	// example, if set to FmtAlwaysQualifyTableNames, the builder fully qualifies
 	// the table name in all column labels before adding them to the metadata.
@@ -75,6 +68,10 @@ type Builder struct {
 	// avoids cluttering test output with schema and catalog names in the general
 	// case.
 	FmtFlags tree.FmtFlags
+
+	// IsCorrelated is set to true during semantic analysis if a scalar variable was
+	// pulled from an outer scope, that is, if the query was found to be correlated.
+	IsCorrelated bool
 
 	factory *norm.Factory
 	stmt    tree.Statement

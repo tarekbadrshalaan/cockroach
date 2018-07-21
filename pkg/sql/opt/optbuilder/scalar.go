@@ -62,18 +62,6 @@ var comparisonOpMap = [tree.NumComparisonOperators]binaryFactoryFunc{
 	tree.JSONSomeExists: (*norm.Factory).ConstructJsonSomeExists,
 }
 
-// TODO(justin): remove this when we can plan inverted index queries.  It's not
-// sufficient to just remove them from the above map, since the heuristic
-// planner uses the same constraint generation code.
-// Not all of these generate inverted index scans today.
-var comparisonOpBlacklist = [tree.NumComparisonOperators]bool{
-	tree.Contains:       true,
-	tree.ContainedBy:    true,
-	tree.JSONExists:     true,
-	tree.JSONAllExists:  true,
-	tree.JSONSomeExists: true,
-}
-
 // Map from tree.BinaryOperator to Factory constructor function.
 var binaryOpMap = [tree.NumBinaryOperators]binaryFactoryFunc{
 	tree.Bitand:            (*norm.Factory).ConstructBitand,
@@ -93,17 +81,6 @@ var binaryOpMap = [tree.NumBinaryOperators]binaryFactoryFunc{
 	tree.JSONFetchVal:      (*norm.Factory).ConstructFetchVal,
 	tree.JSONFetchValPath:  (*norm.Factory).ConstructFetchValPath,
 	tree.JSONFetchTextPath: (*norm.Factory).ConstructFetchTextPath,
-}
-
-// TODO(justin): remove this when we can plan inverted index queries.  It's not
-// sufficient to just remove them from the above map, since the heuristic
-// planner uses the same constraint generation code.
-// Not all of these generate inverted index scans today.
-var binaryOpBlacklist = [tree.NumBinaryOperators]bool{
-	tree.JSONFetchVal:      true,
-	tree.JSONFetchText:     true,
-	tree.JSONFetchValPath:  true,
-	tree.JSONFetchTextPath: true,
 }
 
 // Map from tree.UnaryOperator to Factory constructor function.
@@ -198,13 +175,6 @@ func (b *Builder) buildScalarHelper(
 		// select the right overload. The solution is to wrap any mismatched
 		// arguments with a CastExpr that preserves the static type.
 
-		// This check is so that the heuristic planner can plan inverted index
-		// queries, which the optimizer doesn't support.
-		blacklisted := binaryOpBlacklist[t.Operator] && !b.AllowBlacklistOps
-		if blacklisted {
-			panic(unimplementedf("operator '%s' not supported", t.Operator))
-		}
-
 		fn := binaryOpMap[t.Operator]
 		left, _ := tree.ReType(t.TypedLeft(), t.ResolvedBinOp().LeftType)
 		right, _ := tree.ReType(t.TypedRight(), t.ResolvedBinOp().RightType)
@@ -255,6 +225,12 @@ func (b *Builder) buildScalarHelper(
 		}
 		out = b.factory.ConstructCoalesce(b.factory.InternList(args))
 
+	case *tree.ColumnAccessExpr:
+		input := b.buildScalarHelper(inScope.resolveType(t.Expr, types.Any), "", inScope, nil)
+		out = b.factory.ConstructColumnAccess(
+			input, b.factory.InternTupleOrdinal(memo.TupleOrdinal(t.ColIndex)),
+		)
+
 	case *tree.ComparisonExpr:
 		if sub, ok := t.Right.(*subquery); ok && sub.multiRow {
 			out, _ = b.buildMultiRowSubquery(t, inScope)
@@ -267,11 +243,7 @@ func (b *Builder) buildScalarHelper(
 
 			fn := comparisonOpMap[t.Operator]
 
-			// This check is so that the heuristic planner can plan inverted index
-			// queries, which the optimizer doesn't support.
-			include := !comparisonOpBlacklist[t.Operator] || b.AllowBlacklistOps
-
-			if fn != nil && include {
+			if fn != nil {
 				// Most comparison ops map directly to a factory method.
 				out = fn(b.factory, left, right)
 			} else if b.AllowUnsupportedExpr {
@@ -288,7 +260,7 @@ func (b *Builder) buildScalarHelper(
 		for i := range t.D {
 			list[i] = b.buildScalarHelper(t.D[i], "", inScope, nil)
 		}
-		out = b.factory.ConstructTuple(b.factory.InternList(list))
+		out = b.factory.ConstructTuple(b.factory.InternList(list), b.factory.InternType(t.ResolvedType()))
 
 	case *tree.FuncExpr:
 		return b.buildFunction(t, label, inScope, outScope)
@@ -339,7 +311,7 @@ func (b *Builder) buildScalarHelper(
 		for i := range t.Exprs {
 			list[i] = b.buildScalarHelper(t.Exprs[i].(tree.TypedExpr), "", inScope, nil)
 		}
-		out = b.factory.ConstructTuple(b.factory.InternList(list))
+		out = b.factory.ConstructTuple(b.factory.InternList(list), b.factory.InternType(t.ResolvedType()))
 
 	case *tree.UnaryExpr:
 		out = b.buildScalarHelper(t.TypedInnerExpr(), "", inScope, nil)
@@ -419,7 +391,7 @@ func (b *Builder) buildFunction(
 	}
 
 	// TODO(andyk): Re-enable impure functions once we can properly handle them.
-	if def.Impure && !b.AllowImpureFuncs {
+	if def.Impure && !isGenerator(def) && !b.AllowImpureFuncs {
 		panic(unimplementedf("impure functions are not supported"))
 	}
 
@@ -432,6 +404,10 @@ func (b *Builder) buildFunction(
 	out = b.factory.ConstructFunction(
 		b.factory.InternList(argList), b.factory.InternFuncOpDef(&funcDef),
 	)
+
+	if isGenerator(def) {
+		return b.finishBuildGeneratorFunction(f, out, inScope, outScope)
+	}
 
 	return b.finishBuildScalar(f, out, label, inScope, outScope)
 }

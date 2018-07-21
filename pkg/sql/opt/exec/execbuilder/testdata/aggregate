@@ -23,6 +23,7 @@ group           ·             ·                   (min int, max int, count int
  │              aggregate 8   bool_and(column14)  ·                                                                                                                                                   ·
  │              aggregate 9   bool_or(column16)   ·                                                                                                                                                   ·
  │              aggregate 10  xor_agg(column18)   ·                                                                                                                                                   ·
+ │              scalar        ·                   ·                                                                                                                                                   ·
  └── render     ·             ·                   (column5 int, column14 bool, column16 bool, column18 bytes)                                                                                         ·
       │         render 0      (1)[int]            ·                                                                                                                                                   ·
       │         render 1      (true)[bool]        ·                                                                                                                                                   ·
@@ -58,6 +59,7 @@ render               ·            ·                            (min int, max i
       │              aggregate 7  variance(kv.v)               ·                                                                                                                                                    ·
       │              aggregate 8  bool_and(column14)           ·                                                                                                                                                    ·
       │              aggregate 9  xor_agg(column16)            ·                                                                                                                                                    ·
+      │              scalar       ·                            ·                                                                                                                                                    ·
       └── render     ·            ·                            (column8 int, column14 bool, column16 bytes, "kv.v" int)                                                                                             ·
            │         render 0     (1)[int]                     ·                                                                                                                                                    ·
            │         render 1     ((v)[int] = (1)[int])[bool]  ·                                                                                                                                                    ·
@@ -95,6 +97,7 @@ render                   ·             ·                                 (min 
       │                  aggregate 8   bool_and(column11)                ·                                                                                                                                                 ·
       │                  aggregate 9   bool_or(column11)                 ·                                                                                                                                                 ·
       │                  aggregate 10  xor_agg(column14)                 ·                                                                                                                                                 ·
+      │                  scalar        ·                                 ·                                                                                                                                                 ·
       └── render         ·             ·                                 (column1 int, column11 bool, column14 bytes)                                                                                                      ·
            │             render 0      (1)[int]                          ·                                                                                                                                                 ·
            │             render 1      (true)[bool]                      ·                                                                                                                                                 ·
@@ -136,23 +139,24 @@ render               ·            ·                           (count int, r in
 query TTTTT
 EXPLAIN (TYPES) SELECT count(*), k+v AS r FROM kv GROUP BY k, v
 ----
-render          ·            ·                           (count int, r int)        ·
- │              render 0     (agg0)[int]                 ·                         ·
- │              render 1     ((k)[int] + (v)[int])[int]  ·                         ·
- └── group      ·            ·                           (k int, v int, agg0 int)  ·
-      │         aggregate 0  k                           ·                         ·
-      │         aggregate 1  v                           ·                         ·
-      │         aggregate 2  count_rows()                ·                         ·
-      │         group by     @1-@2                       ·                         ·
-      └── scan  ·            ·                           (k int, v int)            ·
-·               table        kv@primary                  ·                         ·
-·               spans        ALL                         ·                         ·
+render          ·            ·                              (count int, r int)           ·
+ │              render 0     (agg0)[int]                    ·                            ·
+ │              render 1     ((k)[int] + (agg1)[int])[int]  ·                            ·
+ └── group      ·            ·                              (k int, agg0 int, agg1 int)  ·
+      │         aggregate 0  k                              ·                            ·
+      │         aggregate 1  count_rows()                   ·                            ·
+      │         aggregate 2  any_not_null(v)                ·                            ·
+      │         group by     @1                             ·                            ·
+      └── scan  ·            ·                              (k int, v int)               ·
+·               table        kv@primary                     ·                            ·
+·               spans        ALL                            ·                            ·
 
 query TTTTT
 EXPLAIN (TYPES) SELECT count(k) FROM kv
 ----
 group      ·            ·           (count int)  ·
  │         aggregate 0  count(k)    ·            ·
+ │         scalar       ·           ·            ·
  └── scan  ·            ·           (k int)      ·
 ·          table        kv@primary  ·            ·
 ·          spans        ALL         ·            ·
@@ -164,6 +168,7 @@ group      ·            ·           (count int, sum decimal, max int)  ·
  │         aggregate 0  count(k)    ·                                  ·
  │         aggregate 1  sum(k)      ·                                  ·
  │         aggregate 2  max(k)      ·                                  ·
+ │         scalar       ·           ·                                  ·
  └── scan  ·            ·           (k int)                            ·
 ·          table        kv@primary  ·                                  ·
 ·          spans        ALL         ·                                  ·
@@ -173,6 +178,7 @@ EXPLAIN (VERBOSE) SELECT count(DISTINCT a.*) FROM kv a, kv b
 ----
 group                ·            ·                                             (count)                                                       ·
  │                   aggregate 0  count(DISTINCT ((k, v, w, s) AS k, v, w, s))  ·                                                             ·
+ │                   scalar       ·                                             ·                                                             ·
  └── render          ·            ·                                             ("((k, v, w, s) AS k, v, w, s)")                              ·
       │              render 0     ((a.k, a.v, a.w, a.s) AS k, v, w, s)          ·                                                             ·
       └── join       ·            ·                                             (k, v, w, s, k[omitted], v[omitted], w[omitted], s[omitted])  ·
@@ -185,7 +191,7 @@ group                ·            ·                                           
 ·                    spans        ALL                                           ·                                                             ·
 
 query TTT
-SELECT "Tree", "Field", "Description" FROM [
+SELECT tree, field, description FROM [
 EXPLAIN (VERBOSE) SELECT min(b.k) FROM kv a, kv b GROUP BY a.*
 ]
 ----
@@ -193,11 +199,8 @@ render               ·            ·
  │                   render 0     agg0
  └── group           ·            ·
       │              aggregate 0  k
-      │              aggregate 1  v
-      │              aggregate 2  w
-      │              aggregate 3  s
-      │              aggregate 4  min(k)
-      │              group by     @1-@4
+      │              aggregate 1  min(k)
+      │              group by     @1
       └── join       ·            ·
            │         type         cross
            ├── scan  ·            ·
@@ -208,39 +211,28 @@ render               ·            ·
 ·                    spans        ALL
 
 query TTT
-SELECT "Tree", "Field", "Description" FROM [
+SELECT tree, field, description FROM [
 EXPLAIN (VERBOSE) SELECT min(b.k) FROM kv a, kv b GROUP BY (1, (a.*))
 ]
 ----
-render                    ·            ·
- │                        render 0     agg0
- └── group                ·            ·
-      │                   aggregate 0  kv.k
-      │                   aggregate 1  kv.v
-      │                   aggregate 2  kv.w
-      │                   aggregate 3  kv.s
-      │                   aggregate 4  column9
-      │                   aggregate 5  min(kv.k)
-      │                   group by     @2,@3,@4,@5,@1
-      └── render          ·            ·
-           │              render 0     1
-           │              render 1     k
-           │              render 2     v
-           │              render 3     w
-           │              render 4     s
-           │              render 5     k
-           └── join       ·            ·
-                │         type         cross
-                ├── scan  ·            ·
-                │         table        kv@primary
-                │         spans        ALL
-                └── scan  ·            ·
-·                         table        kv@primary
-·                         spans        ALL
+render               ·            ·
+ │                   render 0     agg0
+ └── group           ·            ·
+      │              aggregate 0  k
+      │              aggregate 1  min(k)
+      │              group by     @1
+      └── join       ·            ·
+           │         type         cross
+           ├── scan  ·            ·
+           │         table        kv@primary
+           │         spans        ALL
+           └── scan  ·            ·
+·                    table        kv@primary
+·                    spans        ALL
 
 # A useful optimization: naked tuple expansion in GROUP BY clause.
 query TTT
-SELECT "Tree", "Field", "Description" FROM [
+SELECT tree, field, description FROM [
 EXPLAIN (VERBOSE) SELECT min(b.k) FROM kv a, kv b GROUP BY (a.*)
 ]
 ----
@@ -248,11 +240,8 @@ render               ·            ·
  │                   render 0     agg0
  └── group           ·            ·
       │              aggregate 0  k
-      │              aggregate 1  v
-      │              aggregate 2  w
-      │              aggregate 3  s
-      │              aggregate 4  min(k)
-      │              group by     @1-@4
+      │              aggregate 1  min(k)
+      │              group by     @1
       └── join       ·            ·
            │         type         cross
            ├── scan  ·            ·
@@ -264,18 +253,17 @@ render               ·            ·
 
 # Show reuse of renders expression inside an expansion.
 query TTT
-SELECT "Tree", "Field", "Description" FROM [
-EXPLAIN (VERBOSE) SELECT a.k FROM kv a, kv b GROUP BY a.*
+SELECT tree, field, description FROM [
+EXPLAIN (VERBOSE) SELECT a.v FROM kv a, kv b GROUP BY a.v, a.w, a.s
 ]
 ----
 render               ·            ·
- │                   render 0     k
+ │                   render 0     v
  └── group           ·            ·
-      │              aggregate 0  k
-      │              aggregate 1  v
-      │              aggregate 2  w
-      │              aggregate 3  s
-      │              group by     @1-@4
+      │              aggregate 0  v
+      │              aggregate 1  w
+      │              aggregate 2  s
+      │              group by     @1-@3
       └── join       ·            ·
            │         type         cross
            ├── scan  ·            ·
@@ -298,6 +286,7 @@ EXPLAIN (TYPES) SELECT min(a) FROM abc
 ----
 group      ·            ·                (min string)  ·
  │         aggregate 0  any_not_null(a)  ·             ·
+ │         scalar       ·                ·             ·
  └── scan  ·            ·                (a string)    ·
 ·          table        abc@primary      ·             ·
 ·          spans        ALL              ·             ·
@@ -323,6 +312,7 @@ EXPLAIN (TYPES) SELECT min(x) FROM xyz
 ----
 group      ·            ·                (min int)  ·
  │         aggregate 0  any_not_null(x)  ·          ·
+ │         scalar       ·                ·          ·
  └── scan  ·            ·                (x int)    ·
 ·          table        xyz@xy           ·          ·
 ·          spans        ALL              ·          ·
@@ -333,6 +323,7 @@ EXPLAIN (TYPES) SELECT min(x) FROM xyz WHERE x in (0, 4, 7)
 ----
 group      ·            ·                  (min int)  ·
  │         aggregate 0  any_not_null(x)    ·          ·
+ │         scalar       ·                  ·          ·
  └── scan  ·            ·                  (x int)    ·
 ·          table        xyz@xy             ·          ·
 ·          spans        /0-/1 /4-/5 /7-/8  ·          ·
@@ -341,57 +332,66 @@ group      ·            ·                  (min int)  ·
 query TTTTT
 EXPLAIN (TYPES) SELECT max(x) FROM xyz
 ----
-group      ·            ·       (max int)  ·
- │         aggregate 0  max(x)  ·          ·
- └── scan  ·            ·       (x int)    ·
-·          table        xyz@xy  ·          ·
-·          spans        ALL     ·          ·
+group         ·            ·                (max int)  ·
+ │            aggregate 0  any_not_null(x)  ·          ·
+ │            scalar       ·                ·          ·
+ └── revscan  ·            ·                (x int)    ·
+·             table        xyz@xy           ·          ·
+·             spans        ALL              ·          ·
+·             limit        1                ·          ·
 
 query TTTTT
 EXPLAIN (TYPES) SELECT min(y) FROM xyz WHERE x = 1
 ----
-group           ·            ·                (min int)       ·
- │              aggregate 0  any_not_null(y)  ·               ·
- └── limit      ·            ·                (x int, y int)  ·
-      │         count        (1)[int]         ·               ·
-      └── scan  ·            ·                (x int, y int)  ·
-·               table        xyz@xy           ·               ·
-·               spans        /1/!NULL-/2      ·               ·
+group      ·            ·                (min int)       ·
+ │         aggregate 0  any_not_null(y)  ·               ·
+ │         scalar       ·                ·               ·
+ └── scan  ·            ·                (x int, y int)  ·
+·          table        xyz@xy           ·               ·
+·          spans        /1/!NULL-/2      ·               ·
 
 query TTTTT
 EXPLAIN (TYPES) SELECT max(y) FROM xyz WHERE x = 1
 ----
-group      ·            ·       (max int)       ·
- │         aggregate 0  max(y)  ·               ·
- └── scan  ·            ·       (x int, y int)  ·
-·          table        xyz@xy  ·               ·
-·          spans        /1-/2   ·               ·
+group      ·            ·                (max int)       ·
+ │         aggregate 0  any_not_null(y)  ·               ·
+ │         scalar       ·                ·               ·
+ └── scan  ·            ·                (x int, y int)  ·
+·          table        xyz@xy           ·               ·
+·          spans        /1/!NULL-/2      ·               ·
 
 query TTTTT
-EXPLAIN (TYPES) SELECT min(y) FROM xyz WHERE x = 7
+EXPLAIN (TYPES) SELECT min(y) FROM xyz WHERE z = 7
 ----
-group           ·            ·                (min int)       ·
- │              aggregate 0  any_not_null(y)  ·               ·
- └── limit      ·            ·                (x int, y int)  ·
-      │         count        (1)[int]         ·               ·
-      └── scan  ·            ·                (x int, y int)  ·
-·               table        xyz@xy           ·               ·
-·               spans        /7/!NULL-/8      ·               ·
+group           ·            ·                            (min int)         ·
+ │              aggregate 0  any_not_null(y)              ·                 ·
+ │              scalar       ·                            ·                 ·
+ └── limit      ·            ·                            (y int, z float)  +y
+      │         count        (1)[int]                     ·                 ·
+      └── scan  ·            ·                            (y int, z float)  +y
+·               table        xyz@zyx                      ·                 ·
+·               spans        /7/!NULL-/7.000000000000001  ·                 ·
 
 query TTTTT
-EXPLAIN (TYPES) SELECT max(y) FROM xyz WHERE x = 7
+EXPLAIN (TYPES) SELECT max(y) FROM xyz WHERE z = 7
 ----
-group      ·            ·       (max int)       ·
- │         aggregate 0  max(y)  ·               ·
- └── scan  ·            ·       (x int, y int)  ·
-·          table        xyz@xy  ·               ·
-·          spans        /7-/8   ·               ·
+group                ·            ·                            (max int)         ·
+ │                   aggregate 0  any_not_null(y)              ·                 ·
+ │                   scalar       ·                            ·                 ·
+ └── limit           ·            ·                            (y int, z float)  -y
+      │              count        (1)[int]                     ·                 ·
+      └── sort       ·            ·                            (y int, z float)  -y
+           │         order        -y                           ·                 ·
+           └── scan  ·            ·                            (y int, z float)  ·
+·                    table        xyz@zyx                      ·                 ·
+·                    spans        /7/!NULL-/7.000000000000001  ·                 ·
 
 query TTTTT
 EXPLAIN (TYPES) SELECT min(x) FROM xyz WHERE (y, z) = (2, 3.0)
 ----
 group      ·            ·          (min int)                ·
  │         aggregate 0  min(x)     ·                        ·
+ │         scalar       ·          ·                        ·
  └── scan  ·            ·          (x int, y int, z float)  ·
 ·          table        xyz@zyx    ·                        ·
 ·          spans        /3/2-/3/3  ·                        ·
@@ -411,6 +411,7 @@ EXPLAIN (TYPES) SELECT max(x) FROM xyz WHERE (z, y) = (3.0, 2)
 ----
 group      ·            ·          (max int)                ·
  │         aggregate 0  max(x)     ·                        ·
+ │         scalar       ·          ·                        ·
  └── scan  ·            ·          (x int, y int, z float)  ·
 ·          table        xyz@zyx    ·                        ·
 ·          spans        /3/2-/3/3  ·                        ·
@@ -439,6 +440,7 @@ EXPLAIN (TYPES) SELECT variance(x) FROM xyz WHERE x = 1
 ----
 group      ·            ·            (variance decimal)  ·
  │         aggregate 0  variance(x)  ·                   ·
+ │         scalar       ·            ·                   ·
  └── scan  ·            ·            (x int)             ·
 ·          table        xyz@xy       ·                   ·
 ·          spans        /1-/2        ·                   ·
@@ -613,24 +615,21 @@ render     ·         ·           (a int)  ·
 query TTTTT
 EXPLAIN (TYPES) SELECT sum(abc.d) FROM kv JOIN abc ON kv.k >= abc.d GROUP BY kv.*;
 ----
-render               ·            ·                                 (sum decimal)                                  ·
- │                   render 0     (agg0)[decimal]                   ·                                              ·
- └── group           ·            ·                                 (k int, v int, w int, s string, agg0 decimal)  ·
-      │              aggregate 0  k                                 ·                                              ·
-      │              aggregate 1  v                                 ·                                              ·
-      │              aggregate 2  w                                 ·                                              ·
-      │              aggregate 3  s                                 ·                                              ·
-      │              aggregate 4  sum(d)                            ·                                              ·
-      │              group by     @1-@4                             ·                                              ·
-      └── join       ·            ·                                 (k int, v int, w int, s string, d decimal)     ·
-           │         type         inner                             ·                                              ·
-           │         pred         ((k)[int] >= (d)[decimal])[bool]  ·                                              ·
-           ├── scan  ·            ·                                 (k int, v int, w int, s string)                ·
-           │         table        kv@primary                        ·                                              ·
-           │         spans        ALL                               ·                                              ·
-           └── scan  ·            ·                                 (d decimal)                                    ·
-·                    table        abc@primary                       ·                                              ·
-·                    spans        ALL                               ·                                              ·
+render               ·            ·                                 (sum decimal)          ·
+ │                   render 0     (agg0)[decimal]                   ·                      ·
+ └── group           ·            ·                                 (k int, agg0 decimal)  ·
+      │              aggregate 0  k                                 ·                      ·
+      │              aggregate 1  sum(d)                            ·                      ·
+      │              group by     @1                                ·                      ·
+      └── join       ·            ·                                 (k int, d decimal)     ·
+           │         type         inner                             ·                      ·
+           │         pred         ((k)[int] >= (d)[decimal])[bool]  ·                      ·
+           ├── scan  ·            ·                                 (k int)                ·
+           │         table        kv@primary                        ·                      ·
+           │         spans        ALL                               ·                      ·
+           └── scan  ·            ·                                 (d decimal)            ·
+·                    table        abc@primary                       ·                      ·
+·                    spans        ALL                               ·                      ·
 
 # TODO(radu): single-row optimization not yet supported.
 ## opt_test is used for tests around the single-row optimization for MIN/MAX.
@@ -705,23 +704,23 @@ render     ·         ·                                        (r tuple{int, in
 query TTTTT
 EXPLAIN (TYPES) SELECT min(y), (b, a) r FROM ab, xy GROUP BY (x, (a, b))
 ----
-render               ·            ·                                        (min string, r tuple{int, int})        ·
- │                   render 0     (agg0)[string]                           ·                                      ·
- │                   render 1     (((b)[int], (a)[int]))[tuple{int, int}]  ·                                      ·
- └── group           ·            ·                                        (a int, b int, x string, agg0 string)  ·
-      │              aggregate 0  a                                        ·                                      ·
-      │              aggregate 1  b                                        ·                                      ·
-      │              aggregate 2  x                                        ·                                      ·
-      │              aggregate 3  min(y)                                   ·                                      ·
-      │              group by     @1-@3                                    ·                                      ·
-      └── join       ·            ·                                        (a int, b int, x string, y string)     ·
-           │         type         cross                                    ·                                      ·
-           ├── scan  ·            ·                                        (a int, b int)                         ·
-           │         table        ab@primary                               ·                                      ·
-           │         spans        ALL                                      ·                                      ·
-           └── scan  ·            ·                                        (x string, y string)                   ·
-·                    table        xy@primary                               ·                                      ·
-·                    spans        ALL                                      ·                                      ·
+render               ·            ·                                           (min string, r tuple{int, int})           ·
+ │                   render 0     (agg0)[string]                              ·                                         ·
+ │                   render 1     (((agg1)[int], (a)[int]))[tuple{int, int}]  ·                                         ·
+ └── group           ·            ·                                           (a int, x string, agg0 string, agg1 int)  ·
+      │              aggregate 0  a                                           ·                                         ·
+      │              aggregate 1  x                                           ·                                         ·
+      │              aggregate 2  min(y)                                      ·                                         ·
+      │              aggregate 3  any_not_null(b)                             ·                                         ·
+      │              group by     @1,@3                                       ·                                         ·
+      └── join       ·            ·                                           (a int, b int, x string, y string)        ·
+           │         type         cross                                       ·                                         ·
+           ├── scan  ·            ·                                           (a int, b int)                            ·
+           │         table        ab@primary                                  ·                                         ·
+           │         spans        ALL                                         ·                                         ·
+           └── scan  ·            ·                                           (x string, y string)                      ·
+·                    table        xy@primary                                  ·                                         ·
+·                    spans        ALL                                         ·                                         ·
 
 # Test that ordering on GROUP BY columns is maintained.
 # TODO(radu): Derive GROUP BY ordering in physicalPropsBuilder.
@@ -897,6 +896,7 @@ EXPLAIN (VERBOSE) SELECT array_agg(v) FROM (SELECT * FROM kv ORDER BY v)
 ----
 group           ·            ·             (array_agg)  ·
  │              aggregate 0  array_agg(v)  ·            ·
+ │              scalar       ·             ·            ·
  └── sort       ·            ·             (v)          +v
       │         order        +v            ·            ·
       └── scan  ·            ·             (v)          ·
@@ -919,6 +919,7 @@ EXPLAIN (VERBOSE) SELECT concat_agg(s) FROM (SELECT s FROM kv ORDER BY k)
 ----
 group      ·            ·              (concat_agg)  ·
  │         aggregate 0  concat_agg(s)  ·             ·
+ │         scalar       ·              ·             ·
  └── scan  ·            ·              (k, s)        +k
 ·          table        kv@primary     ·             ·
 ·          spans        ALL            ·             ·
@@ -928,6 +929,7 @@ EXPLAIN (VERBOSE) SELECT array_agg(k) FROM (SELECT k FROM kv ORDER BY s)
 ----
 group           ·            ·             (array_agg)  ·
  │              aggregate 0  array_agg(k)  ·            ·
+ │              scalar       ·             ·            ·
  └── sort       ·            ·             (k, s)       +s
       │         order        +s            ·            ·
       └── scan  ·            ·             (k, s)       ·

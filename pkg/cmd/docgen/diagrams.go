@@ -390,7 +390,7 @@ var specs = []stmtSpec{
 		match:  []*regexp.Regexp{regexp.MustCompile("'BACKUP'")},
 		replace: map[string]string{
 			"non_reserved_word_or_sconst":                     "destination",
-			"'AS' 'OF' 'SYSTEM' 'TIME' a_expr_const":          "'AS OF SYSTEM TIME' timestamp",
+			"'AS' 'OF' 'SYSTEM' 'TIME' a_expr":                "'AS OF SYSTEM TIME' timestamp",
 			"'INCREMENTAL' 'FROM' string_or_placeholder_list": "'INCREMENTAL FROM' full_backup_location ( | ',' incremental_backup_location ( ',' incremental_backup_location )* )",
 			"'WITH' 'OPTIONS' '(' kv_option_list ')'":         "",
 			"targets": "( ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* )",
@@ -782,7 +782,7 @@ var specs = []stmtSpec{
 		stmt:   "restore_stmt",
 		inline: []string{"as_of_clause", "opt_with_options"},
 		replace: map[string]string{
-			"a_expr_const":                            "timestamp",
+			"a_expr":                                  "timestamp",
 			"string_or_placeholder_list":              "full_backup_location ( | incremental_backup_location ( ',' incremental_backup_location )*)",
 			"'WITH' 'OPTIONS' '(' kv_option_list ')'": "",
 			"targets": "( ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* )",
@@ -955,19 +955,9 @@ var specs = []stmtSpec{
 		unlink:  []string{"table_name"},
 	},
 	{
-		name:    "show_create_sequence_stmt",
-		match:   []*regexp.Regexp{regexp.MustCompile("'SHOW' 'CREATE' 'SEQUENCE'")},
-		replace: map[string]string{"var_name": "sequence_name"},
-		unlink:  []string{"sequence_name"},
-	},
-	{
-		name: "show_create_table_stmt",
-	},
-	{
-		name:    "show_create_view_stmt",
-		match:   []*regexp.Regexp{regexp.MustCompile("'SHOW' 'CREATE' 'VIEW'")},
-		replace: map[string]string{"var_name": "view_name"},
-		unlink:  []string{"view_name"},
+		name:    "show_create_stmt",
+		replace: map[string]string{"table_name": "object_name"},
+		unlink:  []string{"object_name"},
 	},
 	{
 		name:  "show_databases",

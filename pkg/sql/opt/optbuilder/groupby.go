@@ -117,7 +117,7 @@ func (b *Builder) hasAggregates(selects tree.SelectExprs, orderBy tree.OrderBy) 
 }
 
 func (b *Builder) constructGroupBy(
-	input memo.GroupID, groupingColSet opt.ColSet, cols []scopeColumn, fromScope *scope,
+	input memo.GroupID, groupingColSet opt.ColSet, cols []scopeColumn, ordering props.OrderingChoice,
 ) memo.GroupID {
 	colList := make(opt.ColList, 0, len(cols))
 	groupList := make([]memo.GroupID, 0, len(cols))
@@ -138,25 +138,19 @@ func (b *Builder) constructGroupBy(
 		}
 	}
 
-	// TODO(justin): we should have a whitelist somewhere of ordering-sensitive
-	// aggregations and only propagate the ordering if we have one here.
-	var ordering props.OrderingChoice
-	if len(cols) > 0 {
-		ordering = fromScope.physicalProps.Ordering
-	}
-
-	return b.factory.ConstructGroupBy(
-		input,
-		b.factory.ConstructAggregations(
-			b.factory.InternList(groupList),
-			b.factory.InternColList(colList),
-		),
-		b.factory.InternGroupByDef(&memo.GroupByDef{
-			GroupingCols: groupingColSet,
-			// The ordering of the GROUP BY is inherited from the input.
-			Ordering: ordering,
-		}),
+	aggs := b.factory.ConstructAggregations(
+		b.factory.InternList(groupList),
+		b.factory.InternColList(colList),
 	)
+	def := b.factory.InternGroupByDef(&memo.GroupByDef{
+		GroupingCols: groupingColSet,
+		// The ordering of the GROUP BY is inherited from the input.
+		Ordering: ordering,
+	})
+	if groupingColSet.Empty() {
+		return b.factory.ConstructScalarGroupBy(input, aggs, def)
+	}
+	return b.factory.ConstructGroupBy(input, aggs, def)
 }
 
 // buildAggregation builds the pre-projection and the aggregation operators.
@@ -227,8 +221,15 @@ func (b *Builder) buildAggregation(
 
 	aggInfos := aggOutScope.groupby.aggs
 
+	// Copy the ordering from fromScope to aggInScope if needed.
+	// TODO(justin): we should have a whitelist somewhere of ordering-sensitive
+	// aggregations and only propagate the ordering if we have one here.
+	if len(aggOutScope.getAggregateCols()) > 0 {
+		aggInScope.copyOrdering(fromScope)
+	}
+
 	// Construct the pre-projection, which renders the grouping columns and the
-	// aggregate arguments.
+	// aggregate arguments, as well as any additional order by columns.
 	b.constructProjectForScope(fromScope, aggInScope)
 
 	// Construct the aggregation operators.
@@ -253,7 +254,7 @@ func (b *Builder) buildAggregation(
 		aggInScope.group,
 		groupingColSet,
 		aggCols,
-		fromScope,
+		aggInScope.physicalProps.Ordering,
 	)
 
 	// Wrap with having filter if it exists.

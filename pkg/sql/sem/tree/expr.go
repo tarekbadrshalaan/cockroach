@@ -74,6 +74,13 @@ type VariableExpr interface {
 	Variable()
 }
 
+var _ VariableExpr = &IndexedVar{}
+var _ VariableExpr = &Subquery{}
+var _ VariableExpr = UnqualifiedStar{}
+var _ VariableExpr = &UnresolvedName{}
+var _ VariableExpr = &AllColumnsSelector{}
+var _ VariableExpr = &ColumnItem{}
+
 // operatorExpr is used to identify expression types that involve operators;
 // used by exprStrWithParen.
 type operatorExpr interface {
@@ -736,8 +743,9 @@ type Tuple struct {
 // NewTypedTuple returns a new Tuple that is verified to be well-typed.
 func NewTypedTuple(typ types.TTuple, typedExprs Exprs) *Tuple {
 	return &Tuple{
-		Exprs: typedExprs,
-		typ:   typ,
+		Exprs:  typedExprs,
+		Labels: typ.Labels,
+		typ:    typ,
 	}
 }
 
@@ -1247,6 +1255,11 @@ func (node *FuncExpr) Format(ctx *FmtCtx) {
 	ctx.WriteString(typ)
 	ctx.FormatNode(&node.Exprs)
 	ctx.WriteByte(')')
+	if node.Filter != nil {
+		ctx.WriteString(" FILTER (WHERE ")
+		ctx.FormatNode(node.Filter)
+		ctx.WriteString(")")
+	}
 	if window := node.WindowDef; window != nil {
 		ctx.WriteString(" OVER ")
 		if window.Name != "" {
@@ -1254,11 +1267,6 @@ func (node *FuncExpr) Format(ctx *FmtCtx) {
 		} else {
 			ctx.FormatNode(window)
 		}
-	}
-	if node.Filter != nil {
-		ctx.WriteString(" FILTER (WHERE ")
-		ctx.FormatNode(node.Filter)
-		ctx.WriteString(")")
 	}
 }
 
@@ -1557,7 +1565,7 @@ func NewTypedColumnAccessExpr(expr TypedExpr, colName string, colIdx int) *Colum
 		Expr:           expr,
 		ColName:        colName,
 		ColIndex:       colIdx,
-		typeAnnotation: typeAnnotation{typ: expr.ResolvedType()},
+		typeAnnotation: typeAnnotation{typ: expr.ResolvedType().(types.TTuple).Types[colIdx]},
 	}
 }
 

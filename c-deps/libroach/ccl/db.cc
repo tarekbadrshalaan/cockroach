@@ -82,6 +82,7 @@ class CCLEnvStatsHandler : public EnvStatsHandler {
   virtual rocksdb::Status GetFileEntryKeyID(const enginepb::FileEntry* entry,
                                             std::string* id) override {
     if (entry == nullptr) {
+      // No file entry: file written in plaintext before the file registry was used.
       *id = kPlainKeyID;
       return rocksdb::Status::OK();
     }
@@ -91,7 +92,7 @@ class CCLEnvStatsHandler : public EnvStatsHandler {
       return rocksdb::Status::InvalidArgument("failed to parse encryption settings");
     }
 
-    if (enc_settings.key_id() == "") {
+    if (enc_settings.encryption_type() == enginepbccl::Plaintext) {
       *id = kPlainKeyID;
     } else {
       *id = enc_settings.key_id();
@@ -118,10 +119,22 @@ rocksdb::Status DBOpenHook(std::shared_ptr<rocksdb::Logger> info_log, const std:
   // We have encryption options. Check whether the AES instruction set is supported.
   if (!UsesAESNI()) {
     // Shout loudly on standard out.
-    std::cout << std::endl
+    std::cerr << std::endl
               << "*** WARNING ***" << std::endl
               << "Encryption requested, but no AES instruction set detected" << std::endl
               << "Expect significant performance degradation!" << std::endl
+              << std::endl;
+  }
+
+  // Attempt to disable core dumps.
+  auto status = DisableCoreFile();
+  if (!status.ok()) {
+    // Shout loudly on standard out.
+    std::cerr << std::endl
+              << "*** WARNING ***" << std::endl
+              << "Encryption requested, but could not disable core dumps: " << status.getState()
+              << std::endl
+              << "Keys may be leaked in core dumps!" << std::endl
               << std::endl;
   }
 
@@ -146,7 +159,7 @@ rocksdb::Status DBOpenHook(std::shared_ptr<rocksdb::Logger> info_log, const std:
   // NOTE: FileKeyManager uses the default env as the MemEnv can never have pre-populated files.
   FileKeyManager* store_key_manager = new FileKeyManager(
       rocksdb::Env::Default(), opts.key_files().current_key(), opts.key_files().old_key());
-  rocksdb::Status status = store_key_manager->LoadKeys();
+  status = store_key_manager->LoadKeys();
   if (!status.ok()) {
     delete store_key_manager;
     return status;

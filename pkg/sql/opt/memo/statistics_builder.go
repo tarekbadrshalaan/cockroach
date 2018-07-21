@@ -195,7 +195,7 @@ func (sb *statisticsBuilder) init(
 // as it gets passed up the expression tree.
 func (sb *statisticsBuilder) colStat(colSet opt.ColSet) *props.ColumnStatistic {
 	if colSet.Len() == 0 {
-		return nil
+		panic("column statistics cannot be determined for empty column set")
 	}
 
 	// Check if the requested column statistic is already cached.
@@ -226,6 +226,9 @@ func (sb *statisticsBuilder) colStat(colSet opt.ColSet) *props.ColumnStatistic {
 	case opt.ScanOp:
 		return sb.colStatScan(colSet)
 
+	case opt.VirtualScanOp:
+		return sb.colStatVirtualScan(colSet)
+
 	case opt.SelectOp:
 		return sb.colStatSelect(colSet)
 
@@ -247,7 +250,7 @@ func (sb *statisticsBuilder) colStat(colSet opt.ColSet) *props.ColumnStatistic {
 		opt.UnionAllOp, opt.IntersectAllOp, opt.ExceptAllOp:
 		return sb.colStatSetOp(colSet)
 
-	case opt.GroupByOp:
+	case opt.GroupByOp, opt.ScalarGroupByOp:
 		return sb.colStatGroupBy(colSet)
 
 	case opt.LimitOp:
@@ -261,6 +264,9 @@ func (sb *statisticsBuilder) colStat(colSet opt.ColSet) *props.ColumnStatistic {
 
 	case opt.RowNumberOp:
 		return sb.colStatRowNumber(colSet)
+
+	case opt.ZipOp:
+		return sb.colStatZip(colSet)
 
 	case opt.ExplainOp, opt.ShowTraceForSessionOp:
 		return sb.colStatMetadata(colSet)
@@ -292,7 +298,6 @@ func (sb *statisticsBuilder) colStatMetadata(colSet opt.ColSet) *props.ColumnSta
 	}
 
 	if colSet.Len() == 1 {
-		// Cast to int64 and then to uint64 to make the linter happy.
 		colStat.DistinctCount = unknownDistinctCountRatio * sb.s.RowCount
 	} else {
 		distinctCount := 1.0
@@ -350,6 +355,24 @@ func (sb *statisticsBuilder) colStatScan(colSet opt.ColSet) *props.ColumnStatist
 	}
 
 	return colStat
+}
+
+// VirtualScan
+// -----------
+
+func (sb *statisticsBuilder) buildVirtualScan(def *VirtualScanOpDef) {
+	s := sb.makeTableStatistics(def.Table)
+	sb.s.RowCount = s.RowCount
+}
+
+func (sb *statisticsBuilder) colStatVirtualScan(colSet opt.ColSet) *props.ColumnStatistic {
+	def := sb.ev.Private().(*VirtualScanOpDef)
+	inputStatsBuilder := statisticsBuilder{
+		s:      sb.makeTableStatistics(def.Table),
+		props:  sb.props,
+		keyBuf: sb.keyBuf,
+	}
+	return sb.copyColStat(&inputStatsBuilder, colSet)
 }
 
 // Select
@@ -587,7 +610,7 @@ func (sb *statisticsBuilder) colStatIndexJoin(colSet opt.ColSet) *props.ColumnSt
 
 func (sb *statisticsBuilder) buildGroupBy(inputStats *props.Statistics, groupingColSet opt.ColSet) {
 	if groupingColSet.Empty() {
-		// Scalar group by.
+		// ScalarGroupBy or GroupBy with empty grouping columns.
 		sb.s.RowCount = 1
 	} else {
 		// Estimate the row count based on the distinct count of the grouping
@@ -599,16 +622,15 @@ func (sb *statisticsBuilder) buildGroupBy(inputStats *props.Statistics, grouping
 }
 
 func (sb *statisticsBuilder) colStatGroupBy(colSet opt.ColSet) *props.ColumnStatistic {
-	inputStats := &sb.ev.childGroup(0).logical.Relational.Stats
 	groupingColSet := sb.ev.Private().(*GroupByDef).GroupingCols
-
 	if groupingColSet.Empty() {
-		// Scalar group by.
+		// ScalarGroupBy or GroupBy with empty grouping columns.
 		colStat := sb.makeColStat(colSet)
 		colStat.DistinctCount = 1
 		return colStat
 	}
 
+	inputStats := &sb.ev.childGroup(0).logical.Relational.Stats
 	inputStatsBuilder := sb.makeStatisticsBuilder(inputStats, sb.ev.Child(0))
 	if !colSet.SubsetOf(groupingColSet) {
 		// Some of the requested columns are aggregates. Estimate the distinct
@@ -825,6 +847,42 @@ func (sb *statisticsBuilder) colStatRowNumber(colSet opt.ColSet) *props.ColumnSt
 	return colStat
 }
 
+// Zip
+// ---
+
+func (sb *statisticsBuilder) buildZip() {
+	// The row count of a zip operation is equal to the maximum row count of its
+	// children.
+	for i := 0; i < sb.ev.ChildCount(); i++ {
+		child := sb.ev.Child(i)
+		if child.Operator() == opt.FunctionOp {
+			def := child.Private().(*FuncOpDef)
+			if def.Overload.Generator != nil {
+				// TODO(rytaft): We may want to estimate the number of rows based on
+				// the type of generator function and its parameters.
+				sb.s.RowCount = unknownRowCount
+				break
+			}
+		}
+
+		// A scalar function generates one row.
+		sb.s.RowCount = 1
+	}
+}
+
+func (sb *statisticsBuilder) colStatZip(colSet opt.ColSet) *props.ColumnStatistic {
+	colStat := sb.makeColStat(colSet)
+	// TODO(rytaft): We may want to determine which generator function the
+	// columns in colSet correspond to, and estimate the distinct count based on
+	// the type of generator function and its parameters.
+	if sb.s.RowCount == 1 {
+		colStat.DistinctCount = 1
+	} else {
+		colStat.DistinctCount = sb.s.RowCount * unknownDistinctCountRatio
+	}
+	return colStat
+}
+
 /////////////////////////////////////////////////
 // General helper functions for building stats //
 /////////////////////////////////////////////////
@@ -902,7 +960,7 @@ func (sb *statisticsBuilder) makeTableStatistics(tabID opt.TableID) *props.Stati
 	stats = &props.Statistics{}
 	if tab.StatisticCount() == 0 {
 		// No statistics.
-		stats.RowCount = 1000
+		stats.RowCount = unknownRowCount
 	} else {
 		// Get the RowCount from the most recent statistic. Stats are ordered
 		// with most recent first.
@@ -1013,6 +1071,9 @@ const (
 	unknownFilterSelectivity = 1.0 / 3.0
 
 	// TODO(rytaft): Add other selectivities for other types of predicates.
+
+	// This is an arbitrary row count used in the absence of any real statistics.
+	unknownRowCount = 1000
 
 	// This is the ratio of distinct column values to number of rows, which is
 	// used in the absence of any real statistics for non-key columns.

@@ -64,6 +64,8 @@ const (
 	VersionSecondaryLookupJoins
 	VersionClientSideWritingFlag
 	VersionColumnarTimeSeries
+	VersionTxnCoordMetaInvalidField
+	VersionAsyncConsensus
 
 	// Add new versions here (step one of two).
 
@@ -240,6 +242,16 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		// VersionColumnarTimeSeries is https://github.com/cockroachdb/cockroach/pull/26614.
 		Key:     VersionColumnarTimeSeries,
 		Version: roachpb.Version{Major: 2, Minor: 0, Unstable: 7},
+	},
+	{
+		// VersionTxnCoordMetaInvalidField is https://github.com/cockroachdb/cockroach/pull/27420.
+		Key:     VersionTxnCoordMetaInvalidField,
+		Version: roachpb.Version{Major: 2, Minor: 0, Unstable: 8},
+	},
+	{
+		// VersionAsyncConsensus is https://github.com/cockroachdb/cockroach/pull/26599.
+		Key:     VersionAsyncConsensus,
+		Version: roachpb.Version{Major: 2, Minor: 0, Unstable: 9},
 	},
 
 	// Add new versions here (step two of two).

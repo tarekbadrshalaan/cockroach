@@ -18,10 +18,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/idxconstraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/xfunc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
@@ -30,7 +29,7 @@ import (
 // CustomFuncs to provide a clean interface for calling functions from both the
 // xform and xfunc packages using the same struct.
 type CustomFuncs struct {
-	xfunc.CustomFuncs
+	norm.CustomFuncs
 	e *explorer
 }
 
@@ -49,7 +48,29 @@ func (c *CustomFuncs) CanGenerateIndexScans(def memo.PrivateID) bool {
 	scanOpDef := c.e.mem.LookupPrivate(def).(*memo.ScanOpDef)
 	return scanOpDef.Index == opt.PrimaryIndex &&
 		scanOpDef.Constraint == nil &&
+		!scanOpDef.Reverse &&
 		scanOpDef.HardLimit == 0
+}
+
+// CanGenerateInvertedIndexScans returns true if new index Scan operators can
+// be generated on inverted indexes. Same as CanGenerateIndexScans, but with
+// the additional check that we have at least one inverted index on the table.
+func (c *CustomFuncs) CanGenerateInvertedIndexScans(def memo.PrivateID) bool {
+	if !c.CanGenerateIndexScans(def) {
+		return false
+	}
+
+	// Don't bother matching unless there's an inverted index.
+	scanOpDef := c.e.mem.LookupPrivate(def).(*memo.ScanOpDef)
+	md := c.e.mem.Metadata()
+	tab := md.Table(scanOpDef.Table)
+	// Index 0 is the primary index and is never inverted.
+	for i, n := 1, tab.IndexCount(); i < n; i++ {
+		if tab.Index(i).IsInverted() {
+			return true
+		}
+	}
+	return false
 }
 
 // GenerateIndexScans enumerates all indexes on the scan operator's table and
@@ -75,7 +96,7 @@ func (c *CustomFuncs) GenerateIndexScans(def memo.PrivateID) []memo.Expr {
 	// Iterate over all secondary indexes (index 0 is the primary index).
 	for i := 1; i < tab.IndexCount(); i++ {
 		if tab.Index(i).IsInverted() {
-			// Ignore inverted indexes for now.
+			// Ignore inverted indexes.
 			continue
 		}
 		indexCols := md.IndexColumns(scanOpDef.Table, i)
@@ -135,6 +156,77 @@ func (c *CustomFuncs) GenerateIndexScans(def memo.PrivateID) []memo.Expr {
 	return c.e.exprs
 }
 
+// GenerateInvertedIndexScans enumerates all inverted indexes on the scan
+// operator's table and generates a scan for each inverted index that can
+// service the query.
+// The resulting scan operator is pre-constrained and may come with an index join.
+// The reason it's pre-constrained is that we cannot treat an inverted index in
+// the same way as a regular index, since it does not actually contain the
+// indexed column.
+func (c *CustomFuncs) GenerateInvertedIndexScans(
+	def memo.PrivateID, filter memo.GroupID,
+) []memo.Expr {
+	c.e.exprs = c.e.exprs[:0]
+	scanOpDef := c.e.mem.LookupPrivate(def).(*memo.ScanOpDef)
+	md := c.e.mem.Metadata()
+	tab := md.Table(scanOpDef.Table)
+
+	primaryIndex := md.Table(scanOpDef.Table).Index(opt.PrimaryIndex)
+	var pkColSet opt.ColSet
+	for i := 0; i < primaryIndex.KeyColumnCount(); i++ {
+		pkColSet.Add(int(md.TableColumn(scanOpDef.Table, primaryIndex.Column(i).Ordinal)))
+	}
+
+	// Iterate over all inverted indexes (index 0 is the primary index and is
+	// never inverted).
+	for i := 1; i < tab.IndexCount(); i++ {
+		if !tab.Index(i).IsInverted() {
+			continue
+		}
+
+		preDef := &memo.ScanOpDef{
+			Table: scanOpDef.Table,
+			Index: i,
+			// Though the index is marked as containing the JSONB column being
+			// indexed, it doesn't actually, and it's only valid to extract the
+			// primary key columns from it.
+			Cols: pkColSet,
+		}
+
+		constrainedScan, remainingFilter, ok := c.constrainedScanOpDef(filter, c.e.mem.InternScanOpDef(preDef), true /* isInverted */)
+		if !ok {
+			continue
+		}
+
+		// TODO(justin): We might not need to do an index join in order to get the
+		// correct columns, but it's difficult to tell at this point.
+		def := c.e.mem.InternIndexJoinDef(&memo.IndexJoinDef{
+			Table: scanOpDef.Table,
+			Cols:  scanOpDef.Cols,
+		})
+		scan := c.e.f.ConstructScan(c.e.mem.InternScanOpDef(&constrainedScan))
+
+		if c.e.mem.NormExpr(remainingFilter).Operator() == opt.TrueOp {
+			c.e.exprs = append(
+				c.e.exprs,
+				memo.Expr(memo.MakeIndexJoinExpr(scan, def)),
+			)
+		} else {
+			c.e.exprs = append(
+				c.e.exprs,
+				memo.Expr(
+					memo.MakeSelectExpr(
+						c.e.f.ConstructIndexJoin(scan, def),
+						remainingFilter,
+					),
+				),
+			)
+		}
+	}
+
+	return c.e.exprs
+}
+
 // ----------------------------------------------------------------------
 //
 // Select Rules
@@ -142,10 +234,9 @@ func (c *CustomFuncs) GenerateIndexScans(def memo.PrivateID) []memo.Expr {
 //
 // ----------------------------------------------------------------------
 
-// CanConstrainScan returns true if the given expression can have a constraint
-// applied to it. This is only possible when it has no constraints and when it
-// does not have a limit applied to it (since limit is applied after the
-// constraint).
+// CanConstrainScan returns true if the scan can have a constraint applied to
+// it. This is only possible when it has no constraints and when it does not
+// have a limit applied to it (since limit is applied after the constraint).
 func (c *CustomFuncs) CanConstrainScan(def memo.PrivateID) bool {
 	scanOpDef := c.e.mem.LookupPrivate(def).(*memo.ScanOpDef)
 	return scanOpDef.Constraint == nil && scanOpDef.HardLimit == 0
@@ -155,7 +246,7 @@ func (c *CustomFuncs) CanConstrainScan(def memo.PrivateID) bool {
 // constraint. If it cannot push the filter down (i.e. the resulting constraint
 // is unconstrained), then it returns ok = false in the third return value.
 func (c *CustomFuncs) constrainedScanOpDef(
-	filterGroup memo.GroupID, scanDef memo.PrivateID,
+	filterGroup memo.GroupID, scanDef memo.PrivateID, isInverted bool,
 ) (newDef memo.ScanOpDef, remainingFilter memo.GroupID, ok bool) {
 	scanOpDef := c.e.mem.LookupPrivate(scanDef).(*memo.ScanOpDef)
 
@@ -179,7 +270,7 @@ func (c *CustomFuncs) constrainedScanOpDef(
 	// Generate index constraints.
 	var ic idxconstraint.Instance
 	filter := memo.MakeNormExprView(c.e.mem, filterGroup)
-	ic.Init(filter, columns, notNullCols, false /* isInverted */, c.e.evalCtx, c.e.f)
+	ic.Init(filter, columns, notNullCols, isInverted, c.e.evalCtx, c.e.f)
 	constraint := ic.Constraint()
 	if constraint.IsUnconstrained() {
 		return memo.ScanOpDef{}, 0, false
@@ -211,7 +302,7 @@ func (c *CustomFuncs) constrainedScanOpDef(
 func (c *CustomFuncs) ConstrainScan(filterGroup memo.GroupID, scanDef memo.PrivateID) []memo.Expr {
 	c.e.exprs = c.e.exprs[:0]
 
-	newDef, remainingFilter, ok := c.constrainedScanOpDef(filterGroup, scanDef)
+	newDef, remainingFilter, ok := c.constrainedScanOpDef(filterGroup, scanDef, false /* isInverted */)
 	if !ok {
 		return nil
 	}
@@ -253,7 +344,7 @@ func (c *CustomFuncs) ConstrainIndexJoinScan(
 ) []memo.Expr {
 	c.e.exprs = c.e.exprs[:0]
 
-	newDef, remainingFilter, ok := c.constrainedScanOpDef(filterGroup, scanDef)
+	newDef, remainingFilter, ok := c.constrainedScanOpDef(filterGroup, scanDef, false /* isInverted */)
 	if !ok {
 		return nil
 	}
@@ -362,13 +453,23 @@ func (c *CustomFuncs) ConstructMergeJoins(
 			break
 		}
 		def := memo.MergeOnDef{JoinType: originalOp}
-		def.LeftEq.Columns = make([]props.OrderingColumnChoice, 0, n)
-		def.RightEq.Columns = make([]props.OrderingColumnChoice, 0, n)
+		def.LeftEq = make(opt.Ordering, n)
+		def.RightEq = make(opt.Ordering, n)
+		def.LeftOrdering.Columns = make([]props.OrderingColumnChoice, 0, n)
+		def.RightOrdering.Columns = make([]props.OrderingColumnChoice, 0, n)
 		for i := 0; i < n; i++ {
 			eqIdx, _ := colToEq.Get(int(o[i].ID()))
-			def.LeftEq.AppendCol(leftEq[eqIdx], o[i].Descending())
-			def.RightEq.AppendCol(rightEq[eqIdx], o[i].Descending())
+			l, r, descending := leftEq[eqIdx], rightEq[eqIdx], o[i].Descending()
+			def.LeftEq[i] = opt.MakeOrderingColumn(l, descending)
+			def.RightEq[i] = opt.MakeOrderingColumn(r, descending)
+			def.LeftOrdering.AppendCol(l, descending)
+			def.RightOrdering.AppendCol(r, descending)
 		}
+
+		// Simplify the orderings with the corresponding FD sets.
+		def.LeftOrdering.Simplify(&c.e.mem.GroupProperties(left).Relational.FuncDeps)
+		def.RightOrdering.Simplify(&c.e.mem.GroupProperties(right).Relational.FuncDeps)
+
 		// TODO(radu): simplify the ON condition (we can remove the equalities we
 		// extracted).
 		mergeOn := c.e.f.ConstructMergeOn(on, c.e.mem.InternMergeOnDef(&def))
@@ -437,6 +538,89 @@ func isJoinEquality(
 	return false, 0, 0
 }
 
+// CanUseLookupJoin returns true if a join with the given join type can be
+// converted to a lookup join. This is only possible when:
+//  - the scan has no constraints, and
+//  - the scan has no limit, and
+//  - a prefix of the scan index columns have equality constraints.
+// We also disallow reverse scans since it's enough to apply the rule on the
+// corresponding forward scan.
+func (c *CustomFuncs) CanUseLookupJoin(
+	input memo.GroupID, scanDefID memo.PrivateID, on memo.GroupID,
+) bool {
+	md := c.e.mem.Metadata()
+	scanDef := c.e.mem.LookupPrivate(scanDefID).(*memo.ScanOpDef)
+	if scanDef.Constraint != nil || scanDef.HardLimit != 0 || scanDef.Reverse {
+		return false
+	}
+
+	inputProps := c.e.mem.GroupProperties(input).Relational
+	onExpr := memo.MakeNormExprView(c.e.mem, on)
+	_, rightEq := harvestEqualityColumns(inputProps.OutputCols, scanDef.Cols, onExpr)
+
+	// Check if the first column in the index has an equality constraint.
+	idx := md.Table(scanDef.Table).Index(scanDef.Index)
+	firstCol := md.TableColumn(scanDef.Table, idx.Column(0).Ordinal)
+	for i := range rightEq {
+		if rightEq[i] == firstCol {
+			return true
+		}
+	}
+	return false
+}
+
+// ConstructLookupJoin creates a lookup join expression.
+func (c *CustomFuncs) ConstructLookupJoin(
+	joinType opt.Operator, input memo.GroupID, scanDefID memo.PrivateID, on memo.GroupID,
+) []memo.Expr {
+	md := c.e.mem.Metadata()
+	scanDef := c.e.mem.LookupPrivate(scanDefID).(*memo.ScanOpDef)
+	inputProps := c.e.mem.GroupProperties(input).Relational
+	onExpr := memo.MakeNormExprView(c.e.mem, on)
+	leftEq, rightEq := harvestEqualityColumns(inputProps.OutputCols, scanDef.Cols, onExpr)
+	n := len(leftEq)
+	if n == 0 {
+		return nil
+	}
+
+	idx := md.Table(scanDef.Table).Index(scanDef.Index)
+	numIndexCols := idx.LaxKeyColumnCount()
+	lookupJoinDef := memo.LookupJoinDef{
+		JoinType:   joinType,
+		Table:      scanDef.Table,
+		Index:      scanDef.Index,
+		LookupCols: scanDef.Cols,
+	}
+	for i := 0; i < numIndexCols; i++ {
+		idxCol := md.TableColumn(scanDef.Table, idx.Column(i).Ordinal)
+		found := -1
+		for j := range rightEq {
+			if rightEq[j] == idxCol {
+				found = j
+			}
+		}
+		if found == -1 {
+			break
+		}
+		inputCol := leftEq[found]
+		if lookupJoinDef.KeyCols == nil {
+			lookupJoinDef.KeyCols = make(opt.ColList, 0, numIndexCols)
+		}
+		lookupJoinDef.KeyCols = append(lookupJoinDef.KeyCols, inputCol)
+	}
+	if lookupJoinDef.KeyCols == nil {
+		// CanUseLookupJoin ensures this is not possible.
+		panic("lookup join not possible")
+	}
+
+	// Create a lookup join expression in the same group.
+	// TODO(radu): simplify the ON condition (we can remove the equalities on
+	// KeyCols).
+	lookupJoin := memo.MakeLookupJoinExpr(input, on, c.e.mem.InternLookupJoinDef(&lookupJoinDef))
+	c.e.exprs = append(c.e.exprs[:0], memo.Expr(lookupJoin))
+	return c.e.exprs
+}
+
 // ----------------------------------------------------------------------
 //
 // GroupBy Rules
@@ -451,15 +635,19 @@ func (c *CustomFuncs) MakeOne() memo.GroupID {
 	return c.e.f.ConstructConst(c.e.f.InternDatum(tree.NewDInt(1)))
 }
 
-// MakeAscOrderingChoiceFromColumn constructs a new OrderingChoice with
-// one element in the sequence: the columnID in the ascending direction.
-func (c *CustomFuncs) MakeAscOrderingChoiceFromColumn(col memo.PrivateID) memo.PrivateID {
+// MakeOrderingChoiceFromColumn constructs a new OrderingChoice with
+// one element in the sequence: the columnID in the order defined by
+// (MIN/MAX) operator. This function was originally created to be used
+// with the Replace(Min|Max)WithLimit exploration rules.
+func (c *CustomFuncs) MakeOrderingChoiceFromColumn(
+	op opt.Operator, col memo.PrivateID,
+) memo.PrivateID {
 	oc := props.OrderingChoice{}
-	oc.AppendCol(c.ExtractColID(col), false /* descending */)
+	switch op {
+	case opt.MinOp:
+		oc.AppendCol(c.ExtractColID(col), false /* descending */)
+	case opt.MaxOp:
+		oc.AppendCol(c.ExtractColID(col), true /* descending */)
+	}
 	return c.e.f.InternOrderingChoice(&oc)
-}
-
-// AnyType returns the private ID of a new AnyTime type.
-func (c *CustomFuncs) AnyType() memo.PrivateID {
-	return c.e.f.InternType(types.Any)
 }

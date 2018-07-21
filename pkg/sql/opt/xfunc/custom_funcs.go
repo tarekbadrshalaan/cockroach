@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 )
 
 // CustomFuncs contains all the custom match and replace functions that are
@@ -68,7 +69,7 @@ func (c *CustomFuncs) IsSortedUniqueList(list memo.ListID) bool {
 // ConstructSortedUniqueList sorts the given list and removes duplicates, and
 // returns the resulting list. See the comment for listSorter.compare for
 // comparison rule details.
-func (c *CustomFuncs) ConstructSortedUniqueList(list memo.ListID) memo.ListID {
+func (c *CustomFuncs) ConstructSortedUniqueList(list memo.ListID) (memo.ListID, memo.PrivateID) {
 	// Make a copy of the list, since it needs to stay immutable.
 	lb := MakeListBuilder(c)
 	lb.AddItems(c.mem.LookupList(list))
@@ -86,7 +87,14 @@ func (c *CustomFuncs) ConstructSortedUniqueList(list memo.ListID) memo.ListID {
 		}
 	}
 	lb.setLength(n)
-	return lb.BuildList()
+
+	// Construct the type of the tuple.
+	typ := types.TTuple{Types: make([]types.T, n)}
+	for i := 0; i < n; i++ {
+		typ.Types[i] = c.mem.GroupProperties(lb.items[i]).Scalar.Type
+	}
+
+	return lb.BuildList(), c.mem.InternType(typ)
 }
 
 // -----------------------------------------------------------------------
@@ -152,21 +160,6 @@ func (c *CustomFuncs) ExtractUnboundConditions(list memo.ListID, group memo.Grou
 	return lb.BuildList()
 }
 
-// -----------------------------------------------------------------------
-//
-//  GroupBy functions
-//   General custom match and replace functions used to test and construct
-//    GroupBy properties
-//
-// -----------------------------------------------------------------------
-
-// IsScalarGroupBy returns true if the given grouping columns come from a
-// "scalar" GroupBy operator. A scalar GroupBy always returns exactly one row,
-// with any aggregate functions operating over the entire input expression.
-func (c *CustomFuncs) IsScalarGroupBy(def memo.PrivateID) bool {
-	return c.mem.LookupPrivate(def).(*memo.GroupByDef).GroupingCols.Empty()
-}
-
 // ----------------------------------------------------------------------
 //
 // Private extraction functions
@@ -193,6 +186,11 @@ func (c *CustomFuncs) ExtractOrdering(private memo.PrivateID) *props.OrderingCho
 // private.
 func (c *CustomFuncs) ExtractProjectionsOpDef(private memo.PrivateID) *memo.ProjectionsOpDef {
 	return c.mem.LookupPrivate(private).(*memo.ProjectionsOpDef)
+}
+
+// ExtractType extracts a types.T from the given private.
+func (c *CustomFuncs) ExtractType(private memo.PrivateID) types.T {
+	return c.mem.LookupPrivate(private).(types.T)
 }
 
 // ----------------------------------------------------------------------
@@ -267,22 +265,13 @@ func (c *CustomFuncs) OuterCols(group memo.GroupID) opt.ColSet {
 	return c.LookupLogical(group).OuterCols()
 }
 
-// ShortestKey returns the strong key in the given memo group that is composed
-// of the fewest columns. If there are multiple keys with the same number of
-// columns, any one of them may be returned. If there are no strong keys in the
-// group, then ShortestKey returns ok=false.
-func (c *CustomFuncs) ShortestKey(group memo.GroupID) (key opt.ColSet, ok bool) {
+// CandidateKey returns the candidate key columns from the given group. If there
+// is no candidate key, CandidateKey returns ok=false.
+func (c *CustomFuncs) CandidateKey(group memo.GroupID) (key opt.ColSet, ok bool) {
 	return c.LookupLogical(group).Relational.FuncDeps.Key()
 }
 
 // IsColNotNull returns true if the given column has the NotNull property.
 func (c *CustomFuncs) IsColNotNull(col memo.PrivateID, input memo.GroupID) bool {
 	return c.LookupLogical(input).Relational.NotNullCols.Contains(int(c.ExtractColID(col)))
-}
-
-// HasColsInOrdering returns true if all columns that appear in an ordering are
-// output columns of the given group.
-func (c *CustomFuncs) HasColsInOrdering(group memo.GroupID, ordering memo.PrivateID) bool {
-	outCols := c.OutputCols(group)
-	return c.ExtractOrdering(ordering).SubsetOfCols(outCols)
 }

@@ -27,6 +27,10 @@ import (
 // indicates an unknown private.
 type PrivateID uint32
 
+// TupleOrdinal is an ordinal index into an expression of type Tuple. It is
+// used by the ColumnAccess scalar expression.
+type TupleOrdinal uint32
+
 // FuncOpDef defines the value of the Def private field of the Function
 // operator. It provides the name and return type of the function, as well as a
 // pointer to an already resolved builtin overload definition.
@@ -70,9 +74,6 @@ func (p ProjectionsOpDef) AllCols() opt.ColSet {
 
 // ScanOpDef defines the value of the Def private field of the Scan operator.
 type ScanOpDef struct {
-	// Reverse defines if the Scan is a reverse scan.
-	Reverse bool
-
 	// Table identifies the table to scan. It is an id that can be passed to
 	// the Metadata.Table method in order to fetch opt.Table metadata.
 	Table opt.TableID
@@ -81,6 +82,9 @@ type ScanOpDef struct {
 	// can be passed to the opt.Table.Index(i int) method in order to fetch the
 	// opt.Index metadata.
 	Index int
+
+	// Reverse indicates if the Scan is a reverse scan.
+	Reverse bool
 
 	// Cols specifies the set of columns that the scan operator projects. This
 	// may be a subset of the columns that the table/index contains.
@@ -96,6 +100,20 @@ type ScanOpDef struct {
 	// if more are available. If its value is zero, then the limit is
 	// unknown, and the scan should return all available rows.
 	HardLimit int64
+}
+
+// VirtualScanOpDef defines the value of the Def private field of the
+// VirtualScan operator.
+type VirtualScanOpDef struct {
+	// Table identifies the virtual table to synthesize and scan. It is an id
+	// that can be passed to the Metadata.Table method in order to fetch
+	// opt.Table metadata.
+	Table opt.TableID
+
+	// Cols specifies the set of columns that the VirtualScan operator projects.
+	// This is always every column in the virtual table (i.e. never a subset even
+	// if all columns are not needed).
+	Cols opt.ColSet
 }
 
 // CanProvideOrdering returns true if the scan operator returns rows that
@@ -116,11 +134,18 @@ func (s *ScanOpDef) CanProvideOrdering(md *opt.Metadata, required *props.Orderin
 	return ordering.SubsetOf(required)
 }
 
-// GroupByDef defines the value of the Def private field of the GroupBy
-// operator.
+// GroupByDef defines the value of the Def private field of the GroupBy and
+// ScalarGroupBy operators. This struct is shared so that both operators can be
+// treated polymorphically.
 type GroupByDef struct {
+	// GroupingCols partitions the GroupBy input rows into aggregation groups.
+	// All rows sharing the same values for these columns are in the same group.
+	// GroupingCols is always empty in the ScalarGroupBy case.
 	GroupingCols opt.ColSet
-	Ordering     props.OrderingChoice
+
+	// Ordering specifies the sort order of values within each group. This is
+	// only significant for order-sensitive aggregation operators, like ArrayAgg.
+	Ordering props.OrderingChoice
 }
 
 // IndexJoinDef defines the value of the Def private field of the IndexJoin
@@ -177,9 +202,8 @@ type LookupJoinDef struct {
 	// index columns (or a prefix of them).
 	KeyCols opt.ColList
 
-	// LookupCols is the set of columns retrieved from the index. This set does
-	// not include the key columns. The LookupJoin operator produces the columns
-	// in its input plus these columns.
+	// LookupCols is the set of columns retrieved from the index. The LookupJoin
+	// operator produces the columns in its input plus these columns.
 	LookupCols opt.ColSet
 }
 
@@ -298,6 +322,13 @@ type MergeOnDef struct {
 	// equality columns (to guarantee a certain output ordering). In the example
 	// above, if we can get ordering a+,b+,c+ on the left side and ordering d+,e+
 	// on the right side, we can guarantee a+,b+,c+ on the merge join results.
-	LeftEq  props.OrderingChoice
-	RightEq props.OrderingChoice
+	LeftEq  opt.Ordering
+	RightEq opt.Ordering
+
+	// LeftOrdering and RightOrdering are "simplified" versions of LeftEq/RightEq,
+	// taking into account functional dependencies. We need both versions because
+	// we need to configure execution with specific equality columns and
+	// orderings.
+	LeftOrdering  props.OrderingChoice
+	RightOrdering props.OrderingChoice
 }

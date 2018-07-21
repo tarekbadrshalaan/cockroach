@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -56,6 +57,8 @@ const (
 	importOptionTransform  = "transform"
 	importOptionSSTSize    = "sstsize"
 	importOptionDecompress = "decompress"
+	importOptionOversample = "oversample"
+	importOptionSkipFKs    = "skip_foreign_keys"
 
 	pgCopyDelimiter = "delimiter"
 	pgCopyNull      = "nullif"
@@ -77,6 +80,9 @@ var importOptionExpectValues = map[string]bool{
 	importOptionTransform:  true,
 	importOptionSSTSize:    true,
 	importOptionDecompress: true,
+	importOptionOversample: true,
+
+	importOptionSkipFKs: false,
 
 	pgMaxRowSize: true,
 }
@@ -117,6 +123,15 @@ func readCreateTableFromStore(
 	return create, nil
 }
 
+type fkHandler struct {
+	allowed  bool
+	skip     bool
+	resolver fkResolver
+}
+
+// NoFKs is used by formats that do not support FKs.
+var NoFKs = fkHandler{}
+
 // MakeSimpleTableDescriptor creates a TableDescriptor from a CreateTable parse
 // node without the full machinery. Many parts of the syntax are unsupported
 // (see the implementation and TestMakeSimpleTableDescriptorErrors for details),
@@ -127,8 +142,10 @@ func MakeSimpleTableDescriptor(
 	create *tree.CreateTable,
 	parentID,
 	tableID sqlbase.ID,
+	fks fkHandler,
 	walltime int64,
 ) (*sqlbase.TableDescriptor, error) {
+
 	sql.HoistConstraints(create)
 	if create.IfNotExists {
 		return nil, errors.New("unsupported IF NOT EXISTS")
@@ -139,8 +156,9 @@ func MakeSimpleTableDescriptor(
 	if create.AsSource != nil {
 		return nil, errors.New("CREATE AS not supported")
 	}
-	for _, def := range create.Defs {
-		switch def := def.(type) {
+	filteredDefs := create.Defs[:0]
+	for i := range create.Defs {
+		switch def := create.Defs[i].(type) {
 		case *tree.CheckConstraintTableDef,
 			*tree.FamilyTableDef,
 			*tree.IndexTableDef,
@@ -151,38 +169,63 @@ func MakeSimpleTableDescriptor(
 				return nil, errors.Errorf("computed columns not supported: %s", tree.AsString(def))
 			}
 		case *tree.ForeignKeyConstraintTableDef:
-			return nil, errors.Errorf("foreign keys not supported: %s", tree.AsString(def))
+			if !fks.allowed {
+				return nil, errors.Errorf("this IMPORT format does not support foreign keys")
+			}
+			if fks.skip {
+				continue
+			}
+			n := tree.MakeTableName("", tree.Name(def.Table.TableNameReference.String()))
+			def.Table.TableNameReference = &n
 		default:
 			return nil, errors.Errorf("unsupported table definition: %s", tree.AsString(def))
 		}
+		// only append this def after we make it past the error checks and continues
+		filteredDefs = append(filteredDefs, create.Defs[i])
 	}
+	create.Defs = filteredDefs
+
 	semaCtx := tree.SemaContext{}
 	evalCtx := tree.EvalContext{
 		CtxProvider: ctxProvider{ctx},
 		Sequence:    &importSequenceOperators{},
 	}
+	affected := make(map[sqlbase.ID]*sqlbase.TableDescriptor)
 	tableDesc, err := sql.MakeTableDesc(
 		ctx,
 		nil, /* txn */
-		nil, /* vt */
+		fks.resolver,
 		st,
 		create,
 		parentID,
 		tableID,
 		hlc.Timestamp{WallTime: walltime},
 		sqlbase.NewDefaultPrivilegeDescriptor(),
-		nil, /* affected */
+		affected,
 		&semaCtx,
 		&evalCtx,
 	)
 	if err != nil {
 		return nil, err
 	}
+	// If the table had a FK, it was put into the ADD state and its references were marked as validated. We need to undo those changes.
+	tableDesc.State = sqlbase.TableDescriptor_PUBLIC
+	if err := tableDesc.ForeachNonDropIndex(func(idx *sqlbase.IndexDescriptor) error {
+		if idx.ForeignKey.IsSet() {
+			idx.ForeignKey.Validity = sqlbase.ConstraintValidity_Unvalidated
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
 
 	return &tableDesc, nil
 }
 
-var errSequenceOperators = errors.New("sequence operations unsupported")
+var (
+	errSequenceOperators = errors.New("sequence operations unsupported")
+	errSchemaResolver    = errors.New("schema resolver unsupported")
+)
 
 // Implements the tree.SequenceOperators interface.
 type importSequenceOperators struct {
@@ -192,7 +235,7 @@ type importSequenceOperators struct {
 func (so *importSequenceOperators) ParseQualifiedTableName(
 	ctx context.Context, sql string,
 ) (*tree.TableName, error) {
-	return nil, errSequenceOperators
+	return parser.ParseTableName(sql)
 }
 
 // Implements the tree.EvalDatabase interface.
@@ -226,6 +269,63 @@ func (so *importSequenceOperators) SetSequenceValue(
 	ctx context.Context, seqName *tree.TableName, newVal int64, isCalled bool,
 ) error {
 	return errSequenceOperators
+}
+
+type fkResolver map[string]*sqlbase.TableDescriptor
+
+var _ sql.SchemaResolver = fkResolver{}
+
+// Implements the sql.SchemaResolver interface.
+func (r fkResolver) Txn() *client.Txn {
+	return nil
+}
+
+// Implements the sql.SchemaResolver interface.
+func (r fkResolver) LogicalSchemaAccessor() sql.SchemaAccessor {
+	return nil
+}
+
+// Implements the sql.SchemaResolver interface.
+func (r fkResolver) CurrentDatabase() string {
+	return ""
+}
+
+// Implements the sql.SchemaResolver interface.
+func (r fkResolver) CurrentSearchPath() sessiondata.SearchPath {
+	return sessiondata.SearchPath{}
+}
+
+// Implements the sql.SchemaResolver interface.
+func (r fkResolver) CommonLookupFlags(ctx context.Context, required bool) sql.CommonLookupFlags {
+	return sql.CommonLookupFlags{}
+}
+
+// Implements the sql.SchemaResolver interface.
+func (r fkResolver) ObjectLookupFlags(ctx context.Context, required bool) sql.ObjectLookupFlags {
+	return sql.ObjectLookupFlags{}
+}
+
+// Implements the tree.TableNameExistingResolver interface.
+func (r fkResolver) LookupObject(
+	ctx context.Context, dbName, scName, obName string,
+) (found bool, objMeta tree.NameResolutionResult, err error) {
+	tbl, ok := r[obName]
+	if ok {
+		return true, tbl, nil
+	}
+	names := make([]string, 0, len(r))
+	for k := range r {
+		names = append(names, k)
+	}
+	suggestions := strings.Join(names, ",")
+	return false, nil, errors.Errorf("referenced table %q not found in tables being imported (%s)", obName, suggestions)
+}
+
+// Implements the tree.TableNameTargetResolver interface.
+func (r fkResolver) LookupSchema(
+	ctx context.Context, dbName, scName string,
+) (found bool, scMeta tree.SchemaMeta, err error) {
+	return false, nil, errSchemaResolver
 }
 
 const csvDatabaseName = "csv"
@@ -537,6 +637,19 @@ func importPlanHook(
 			}
 			sstSize = sz
 		}
+		var oversample int64
+		if override, ok := opts[importOptionOversample]; ok {
+			os, err := strconv.ParseInt(override, 10, 64)
+			if err != nil {
+				return err
+			}
+			sstSize = os
+		}
+
+		var skipFKs bool
+		if _, ok := opts[importOptionSkipFKs]; ok {
+			skipFKs = true
+		}
 
 		if override, ok := opts[importOptionDecompress]; ok {
 			found := false
@@ -571,11 +684,12 @@ func importPlanHook(
 			if table != nil {
 				match = table.TableName.String()
 			}
+			fks := fkHandler{skip: skipFKs, allowed: true, resolver: make(fkResolver)}
 			switch format.Format {
 			case roachpb.IOFileFormat_Mysqldump:
 			case roachpb.IOFileFormat_PgDump:
 				evalCtx := &p.ExtendedEvalContext().EvalContext
-				tableDescs, err = readPostgresCreateTable(reader, evalCtx, p.ExecCfg().Settings, match, parentID, walltime, int(format.PgDump.MaxRowSize))
+				tableDescs, err = readPostgresCreateTable(reader, evalCtx, p.ExecCfg().Settings, match, parentID, walltime, fks, int(format.PgDump.MaxRowSize))
 			default:
 				return errors.Errorf("non-bundle format %q does not support reading schemas", format.Format.String())
 			}
@@ -616,7 +730,7 @@ func importPlanHook(
 			}
 
 			tbl, err := MakeSimpleTableDescriptor(
-				ctx, p.ExecCfg().Settings, create, parentID, defaultCSVTableID, walltime)
+				ctx, p.ExecCfg().Settings, create, parentID, defaultCSVTableID, NoFKs, walltime)
 			if err != nil {
 				return err
 			}
@@ -649,11 +763,19 @@ func importPlanHook(
 			// restoring. We do this last because we want to avoid calling
 			// GenerateUniqueDescID if there's any kind of error above.
 			// Reserving a table ID now means we can avoid the rekey work during restore.
+			tableRewrites := make(backupccl.TableRewriteMap)
 			for _, tableDesc := range tableDescs {
-				tableDesc.ID, err = sql.GenerateUniqueDescID(ctx, p.ExecCfg().DB)
+				id, err := sql.GenerateUniqueDescID(ctx, p.ExecCfg().DB)
 				if err != nil {
 					return err
 				}
+				tableRewrites[tableDesc.ID] = &jobspb.RestoreDetails_TableRewrite{
+					TableID:  id,
+					ParentID: parentID,
+				}
+			}
+			if err := backupccl.RewriteTableDescs(tableDescs, tableRewrites, ""); err != nil {
+				return err
 			}
 		}
 
@@ -675,7 +797,9 @@ func importPlanHook(
 				Tables:     tableDetails,
 				BackupPath: transform,
 				SSTSize:    sstSize,
+				Oversample: oversample,
 				Walltime:   walltime,
+				SkipFKs:    skipFKs,
 			},
 			Progress: jobspb.ImportProgress{},
 		})
@@ -698,6 +822,7 @@ func doDistributedCSVTransform(
 	format roachpb.IOFileFormat,
 	walltime int64,
 	sstSize int64,
+	oversample int64,
 ) error {
 	evalCtx := p.ExtendedEvalContext()
 
@@ -726,6 +851,7 @@ func doDistributedCSVTransform(
 		format,
 		walltime,
 		sstSize,
+		oversample,
 		func(descs map[sqlbase.ID]*sqlbase.TableDescriptor) (sql.KeyRewriter, error) {
 			return storageccl.MakeKeyRewriter(descs)
 		},
@@ -837,6 +963,7 @@ func (r *importResumer) Resume(
 	parentID := details.ParentID
 	sstSize := details.SSTSize
 	format := details.Format
+	oversample := details.Oversample
 
 	if sstSize == 0 {
 		// The distributed importer will correctly chunk up large ranges into
@@ -864,7 +991,7 @@ func (r *importResumer) Resume(
 	}
 
 	return doDistributedCSVTransform(
-		ctx, job, files, p, parentID, tables, transform, format, walltime, sstSize,
+		ctx, job, files, p, parentID, tables, transform, format, walltime, sstSize, oversample,
 	)
 }
 

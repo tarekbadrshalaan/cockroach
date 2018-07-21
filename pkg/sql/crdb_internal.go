@@ -380,13 +380,21 @@ CREATE TABLE crdb_internal.leases (
 	},
 }
 
+func tsOrNull(micros int64) tree.Datum {
+	if micros == 0 {
+		return tree.DNull
+	}
+	ts := timeutil.Unix(0, micros*time.Microsecond.Nanoseconds())
+	return tree.MakeDTimestamp(ts, time.Microsecond)
+}
+
 var crdbInternalJobsTable = virtualSchemaTable{
 	schema: `
 CREATE TABLE crdb_internal.jobs (
-	id                 INT,
-	type               STRING,
+	job_id             INT,
+	job_type           STRING,
 	description        STRING,
-	username           STRING,
+	user_name          STRING,
 	descriptor_ids     INT[],
 	status             STRING,
 	created            TIMESTAMP,
@@ -409,44 +417,67 @@ CREATE TABLE crdb_internal.jobs (
 
 		for _, r := range rows {
 			id, status, created, payloadBytes, progressBytes := r[0], r[1], r[2], r[3], r[4]
+
+			var jobType, description, username, descriptorIDs, started,
+				finished, modified, fractionCompleted, errorStr, leaseNode = tree.DNull,
+				tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull,
+				tree.DNull, tree.DNull
+
+			// Extract data from the payload.
 			payload, err := jobs.UnmarshalPayload(payloadBytes)
 			if err != nil {
-				return err
-			}
-			progress, err := jobs.UnmarshalProgress(progressBytes)
-			if err != nil {
-				return err
-			}
-			tsOrNull := func(micros int64) tree.Datum {
-				if micros == 0 {
-					return tree.DNull
+				errorStr = tree.NewDString(fmt.Sprintf("error decoding payload: %v", err))
+			} else {
+				jobType = tree.NewDString(payload.Type().String())
+				description = tree.NewDString(payload.Description)
+				username = tree.NewDString(payload.Username)
+				descriptorIDsArr := tree.NewDArray(types.Int)
+				for _, descID := range payload.DescriptorIDs {
+					if err := descriptorIDsArr.Append(tree.NewDInt(tree.DInt(int(descID)))); err != nil {
+						return err
+					}
 				}
-				ts := timeutil.Unix(0, micros*time.Microsecond.Nanoseconds())
-				return tree.MakeDTimestamp(ts, time.Microsecond)
+				descriptorIDs = descriptorIDsArr
+				started = tsOrNull(payload.StartedMicros)
+				finished = tsOrNull(payload.FinishedMicros)
+				if payload.Lease != nil {
+					leaseNode = tree.NewDInt(tree.DInt(payload.Lease.NodeID))
+				}
+				errorStr = tree.NewDString(payload.Error)
 			}
-			descriptorIDs := tree.NewDArray(types.Int)
-			for _, descID := range payload.DescriptorIDs {
-				if err := descriptorIDs.Append(tree.NewDInt(tree.DInt(int(descID)))); err != nil {
-					return err
+
+			// Extract data from the progress field.
+			if progressBytes != tree.DNull {
+				progress, err := jobs.UnmarshalProgress(progressBytes)
+				if err != nil {
+					baseErr := ""
+					if s, ok := errorStr.(*tree.DString); ok {
+						baseErr = string(*s)
+						if baseErr != "" {
+							baseErr += "\n"
+						}
+					}
+					errorStr = tree.NewDString(fmt.Sprintf("%serror decoding progress: %v", baseErr, err))
+				} else {
+					fractionCompleted = tree.NewDFloat(tree.DFloat(progress.FractionCompleted))
+					modified = tsOrNull(progress.ModifiedMicros)
 				}
 			}
-			leaseNode := tree.DNull
-			if payload.Lease != nil {
-				leaseNode = tree.NewDInt(tree.DInt(payload.Lease.NodeID))
-			}
+
+			// Report the data.
 			if err := addRow(
 				id,
-				tree.NewDString(payload.Type().String()),
-				tree.NewDString(payload.Description),
-				tree.NewDString(payload.Username),
+				jobType,
+				description,
+				username,
 				descriptorIDs,
 				status,
 				created,
-				tsOrNull(payload.StartedMicros),
-				tsOrNull(payload.FinishedMicros),
-				tsOrNull(progress.ModifiedMicros),
-				tree.NewDFloat(tree.DFloat(progress.FractionCompleted)),
-				tree.NewDString(payload.Error),
+				started,
+				finished,
+				modified,
+				fractionCompleted,
+				errorStr,
 				leaseNode,
 			); err != nil {
 				return err
@@ -617,8 +648,8 @@ CREATE TABLE crdb_internal.session_trace (
 var crdbInternalClusterSettingsTable = virtualSchemaTable{
 	schema: `
 CREATE TABLE crdb_internal.cluster_settings (
-  name          STRING NOT NULL,
-  current_value STRING NOT NULL,
+  variable      STRING NOT NULL,
+  value         STRING NOT NULL,
   type          STRING NOT NULL,
   description   STRING NOT NULL
 );
@@ -669,7 +700,7 @@ const queriesSchemaPattern = `
 CREATE TABLE crdb_internal.%s (
   query_id         STRING,         -- the cluster-unique ID of the query
   node_id          INT NOT NULL,   -- the node on which the query is running
-  username         STRING,         -- the user running the query
+  user_name        STRING,         -- the user running the query
   start            TIMESTAMP,      -- the start time of the query
   query            STRING,         -- the SQL code of the query
   client_address   STRING,         -- the address of the client that issued the query
@@ -763,7 +794,7 @@ const sessionsSchemaPattern = `
 CREATE TABLE crdb_internal.%s (
   node_id            INT NOT NULL,   -- the node on which the query is running
   session_id         STRING,         -- the ID of the session
-  username           STRING,         -- the user running the query
+  user_name          STRING,         -- the user running the query
   client_address     STRING,         -- the address of the client that issued the query
   application_name   STRING,         -- the name of the application as per SET application_name
   active_queries     STRING,         -- the currently running queries as SQL
@@ -1598,10 +1629,10 @@ CREATE TABLE crdb_internal.ranges (
 var crdbInternalZonesTable = virtualSchemaTable{
 	schema: `
 CREATE TABLE crdb_internal.zones (
-  id            INT NOT NULL,
-  cli_specifier STRING,
-  config_yaml   BYTES NOT NULL,
-  config_proto  BYTES NOT NULL
+  zone_id          INT NOT NULL,
+  cli_specifier    STRING,
+  config_yaml      BYTES NOT NULL,
+  config_protobuf  BYTES NOT NULL
 )
 `,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {

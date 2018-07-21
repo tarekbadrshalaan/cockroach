@@ -422,6 +422,13 @@ func (n *Node) bootstrap(
 	return nil
 }
 
+func (n *Node) onClusterVersionChange(cv cluster.ClusterVersion) {
+	ctx := n.AnnotateCtx(context.Background())
+	if err := n.stores.OnClusterVersionChange(ctx, cv); err != nil {
+		log.Fatal(ctx, errors.Wrapf(err, "updating cluster version to %s", cv))
+	}
+}
+
 // start starts the node by registering the storage instance for the
 // RPC service "Node" and initializing stores for each specified
 // engine. Launches periodic store gossiping in a goroutine.
@@ -435,12 +442,7 @@ func (n *Node) start(
 ) error {
 	n.initDescriptor(addr, attrs, locality)
 
-	n.storeCfg.Settings.Version.OnChange(func(cv cluster.ClusterVersion) {
-		if err := n.stores.OnClusterVersionChange(ctx, cv); err != nil {
-			log.Fatal(ctx, errors.Wrapf(err, "updating cluster version to %s", cv))
-		}
-	})
-
+	n.storeCfg.Settings.Version.OnChange(n.onClusterVersionChange)
 	if err := n.storeCfg.Settings.InitializeVersion(cv); err != nil {
 		return errors.Wrap(err, "while initializing cluster version")
 	}
@@ -544,7 +546,7 @@ func (n *Node) startStores(
 		if s.Ident.ClusterID == (uuid.UUID{}) || s.Ident.NodeID == 0 {
 			return errors.Errorf("unidentified store: %s", s)
 		}
-		capacity, err := s.Capacity()
+		capacity, err := s.Capacity(false /* useCached */)
 		if err != nil {
 			return errors.Errorf("could not query store capacity: %s", err)
 		}
@@ -652,10 +654,16 @@ func (n *Node) bootstrapStores(
 		StoreID:   firstID,
 	}
 
-	// FIXME(tschottdorf): what is this version if we're joining a cluster?
-	// I think it's our `MinSupportedVersion`, which is the best we can do
-	// but isn't technically "correct". We should be able to wait for an
-	// authoritative version from gossip here.
+	// There's a bit of an awkward dance around cluster versions here. If this node
+	// is joining an existing cluster for the first time, it doesn't have any engines
+	// set up yet, and cv below will be the MinSupportedVersion. At the same time,
+	// the Gossip update which notifies us about the real cluster version won't
+	// persist it to any engines (because none of them are bootstrapped). The correct
+	// version is likely in Settings.Version.Version(), but what if the callback fires
+	// too late? In that case that too is the MinSupportedVersion. So we just accept
+	// that we won't use the correct version here, but post-bootstrapping will invoke
+	// the callback manually, which will disseminate the correct version to all engines
+	// that still need it.
 	cv, err := n.stores.SynthesizeClusterVersion(ctx)
 	if err != nil {
 		log.Fatalf(ctx, "error retrieving cluster version for bootstrap: %s", err)
@@ -673,10 +681,13 @@ func (n *Node) bootstrapStores(
 		log.Infof(ctx, "bootstrapped store %s", s)
 		// Done regularly in Node.startGossip, but this cuts down the time
 		// until this store is used for range allocations.
-		if err := s.GossipStore(ctx); err != nil {
+		if err := s.GossipStore(ctx, false /* useCached */); err != nil {
 			log.Warningf(ctx, "error doing initial gossiping: %s", err)
 		}
 	}
+	clusterVersion := n.storeCfg.Settings.Version.Version()
+	n.onClusterVersionChange(clusterVersion)
+
 	// write a new status summary after all stores have been bootstrapped; this
 	// helps the UI remain responsive when new nodes are added.
 	if err := n.writeNodeStatus(ctx, 0 /* alertTTL */); err != nil {
@@ -761,7 +772,7 @@ func (n *Node) startGossip(ctx context.Context, stopper *stop.Stopper) {
 // gossipStores broadcasts each store and dead replica to the gossip network.
 func (n *Node) gossipStores(ctx context.Context) {
 	if err := n.stores.VisitStores(func(s *storage.Store) error {
-		if err := s.GossipStore(ctx); err != nil {
+		if err := s.GossipStore(ctx, false /* useCached */); err != nil {
 			return err
 		}
 		return s.GossipDeadReplicas(ctx)

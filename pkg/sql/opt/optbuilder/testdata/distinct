@@ -182,7 +182,7 @@ group-by
 build
 SELECT count(*) FROM (SELECT DISTINCT y FROM xyz)
 ----
-group-by
+scalar-group-by
  ├── columns: count:4(int)
  ├── project
  │    └── group-by
@@ -285,7 +285,7 @@ group-by
  └── project
       ├── columns: r:1(int!null)
       ├── values
-      │    └── tuple [type=tuple{}]
+      │    └── tuple [type=tuple]
       └── projections
            └── const: 3 [type=int]
 

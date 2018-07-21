@@ -168,25 +168,21 @@ func (v *planVisitor) visit(plan planNode) {
 		v.visit(n.index)
 		v.visit(n.table)
 
+	case *lookupJoinNode:
+		if v.observer.attr != nil {
+			v.observer.attr(name, "type", joinTypeStr(n.joinType))
+		}
+		if v.observer.expr != nil && n.onCond != nil && n.onCond != tree.DBoolTrue {
+			v.expr(name, "pred", -1, n.onCond)
+		}
+		v.visit(n.input)
+		v.visit(n.table)
+
 	case *joinNode:
 		if v.observer.attr != nil {
-			jType := ""
-			switch n.joinType {
-			case sqlbase.InnerJoin:
-				jType = "inner"
-				if len(n.pred.leftColNames) == 0 && n.pred.onCond == nil {
-					jType = "cross"
-				}
-			case sqlbase.LeftOuterJoin:
-				jType = "left outer"
-			case sqlbase.RightOuterJoin:
-				jType = "right outer"
-			case sqlbase.FullOuterJoin:
-				jType = "full outer"
-			case sqlbase.LeftSemiJoin:
-				jType = "semi"
-			case sqlbase.LeftAntiJoin:
-				jType = "anti"
+			jType := joinTypeStr(n.joinType)
+			if n.joinType == sqlbase.InnerJoin && len(n.pred.leftColNames) == 0 && n.pred.onCond == nil {
+				jType = "cross"
 			}
 			v.observer.attr(name, "type", jType)
 
@@ -325,6 +321,9 @@ func (v *planVisitor) visit(plan planNode) {
 					}
 					v.observer.attr(name, "group by", buf.String())
 				}
+			}
+			if n.isScalar {
+				v.observer.attr(name, "scalar", "")
 			}
 		}
 
@@ -502,6 +501,11 @@ func (v *planVisitor) visit(plan planNode) {
 	case *controlJobsNode:
 		v.visit(n.rows)
 
+	case *setZoneConfigNode:
+		if v.observer.expr != nil {
+			v.observer.expr(name, "yaml", -1, n.yamlConfig)
+		}
+
 	case *projectSetNode:
 		if v.observer.expr != nil {
 			for i, texpr := range n.exprs {
@@ -550,6 +554,24 @@ func nodeName(plan planNode) string {
 	return name
 }
 
+func joinTypeStr(t sqlbase.JoinType) string {
+	switch t {
+	case sqlbase.InnerJoin:
+		return "inner"
+	case sqlbase.LeftOuterJoin:
+		return "left outer"
+	case sqlbase.RightOuterJoin:
+		return "right outer"
+	case sqlbase.FullOuterJoin:
+		return "full outer"
+	case sqlbase.LeftSemiJoin:
+		return "semi"
+	case sqlbase.LeftAntiJoin:
+		return "anti"
+	}
+	panic(fmt.Sprintf("unknown join type %s", t))
+}
+
 // planNodeNames is the mapping from node type to strings.  The
 // strings are constant and not precomputed so that the type names can
 // be changed without changing the output of "EXPLAIN".
@@ -586,6 +608,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&insertNode{}):               "insert",
 	reflect.TypeOf(&joinNode{}):                 "join",
 	reflect.TypeOf(&limitNode{}):                "limit",
+	reflect.TypeOf(&lookupJoinNode{}):           "lookup-join",
 	reflect.TypeOf(&ordinalityNode{}):           "ordinality",
 	reflect.TypeOf(&projectSetNode{}):           "project set",
 	reflect.TypeOf(&relocateNode{}):             "relocate",

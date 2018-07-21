@@ -41,6 +41,10 @@ type scope struct {
 	groupby       groupby
 	physicalProps props.Physical
 
+	// orderByCols contains all the columns specified by the ORDER BY clause.
+	// There may be some overlap with the columns in cols.
+	orderByCols []scopeColumn
+
 	// group is the memo.GroupID of the relational operator built with this scope.
 	group memo.GroupID
 
@@ -48,6 +52,10 @@ type scope struct {
 	// type checking. This only applies to the top-level subqueries that are
 	// anchored directly to a relational expression.
 	columns int
+
+	// This is a temporary flag, which is currently used to allow generator
+	// functions in the FROM clause, but not in the SELECT list.
+	allowGeneratorFunc bool
 }
 
 // groupByStrSet is a set of stringified GROUP BY expressions that map to the
@@ -113,6 +121,26 @@ func (s *scope) appendColumn(col *scopeColumn, label string) *scopeColumn {
 		newCol.name = tree.Name(label)
 	}
 	return newCol
+}
+
+// copyPhysicalProps copies the physicalProps from the src scope to this scope.
+func (s *scope) copyPhysicalProps(src *scope) {
+	s.physicalProps.Presentation = src.physicalProps.Presentation
+	s.copyOrdering(src)
+}
+
+// copyOrdering copies the ordering and orderByCols from the src scope to this
+// scope. The groups in the new columns are reset to 0.
+func (s *scope) copyOrdering(src *scope) {
+	s.physicalProps.Ordering = src.physicalProps.Ordering
+
+	l := len(s.orderByCols)
+	s.orderByCols = append(s.orderByCols, src.orderByCols...)
+	// We want to reset the groups, as these become pass-through columns in the
+	// new scope.
+	for i := l; i < len(s.orderByCols); i++ {
+		s.orderByCols[i].group = 0
+	}
 }
 
 // setPresentation sets s.physicalProps.Presentation (if not already set).
@@ -217,18 +245,53 @@ func (s *scope) hasColumn(id opt.ColumnID) bool {
 	return false
 }
 
-// hasSameColumns returns true if this scope has the same columns
-// as the other scope (in the same order).
-func (s *scope) hasSameColumns(other *scope) bool {
-	if len(s.cols) != len(other.cols) {
-		return false
-	}
+// colSet returns a ColSet of all the columns in this scope,
+// excluding orderByCols.
+func (s *scope) colSet() opt.ColSet {
+	var colSet opt.ColSet
 	for i := range s.cols {
-		if s.cols[i].id != other.cols[i].id {
-			return false
+		colSet.Add(int(s.cols[i].id))
+	}
+	return colSet
+}
+
+// colSetWithOrderBy returns a ColSet of all the columns in this scope,
+// including orderByCols.
+func (s *scope) colSetWithOrderBy() opt.ColSet {
+	var colSet opt.ColSet
+	for i := range s.cols {
+		colSet.Add(int(s.cols[i].id))
+	}
+	for i := range s.orderByCols {
+		colSet.Add(int(s.orderByCols[i].id))
+	}
+	return colSet
+}
+
+// hasSameColumns returns true if this scope has the same columns
+// as the other scope.
+//
+// NOTE: This function is currently only called by
+// Builder.constructProjectForScope, which uses it to determine whether or not
+// to construct a projection. Since the projection includes all the order by
+// columns, this check is sufficient to determine whether or not the projection
+// is necessary. Be careful if using this function for another purpose.
+func (s *scope) hasSameColumns(other *scope) bool {
+	return s.colSetWithOrderBy().Equals(other.colSetWithOrderBy())
+}
+
+// hasExtraOrderByCols returns true if there are some ORDER BY columns in
+// s.orderByCols that are not included in s.cols.
+func (s *scope) hasExtraOrderByCols() bool {
+	if len(s.orderByCols) > 0 {
+		cols := s.colSet()
+		for _, c := range s.orderByCols {
+			if !cols.Contains(int(c.id)) {
+				return true
+			}
 		}
 	}
-	return true
+	return false
 }
 
 // removeHiddenCols removes hidden columns from the scope.
@@ -243,6 +306,12 @@ func (s *scope) removeHiddenCols() {
 		}
 	}
 	s.cols = s.cols[:n]
+}
+
+// isAnonymousTable returns true if the table name of the first column
+// in this scope is empty.
+func (s *scope) isAnonymousTable() bool {
+	return len(s.cols) > 0 && s.cols[0].table.TableName == ""
 }
 
 // setTableAlias qualifies the names of all columns in this scope with the
@@ -575,9 +644,14 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 		if err != nil {
 			panic(builderError{err})
 		}
-		if isGenerator(def) {
+		if !s.allowGeneratorFunc && isGenerator(def) {
 			panic(unimplementedf("generator functions are not supported"))
 		}
+
+		// Disallow nested SRFs. This field is currently set in Builder.buildZip().
+		// TODO(rytaft): This is a temporary solution and will need to change once
+		// we support SRFs in the SELECT list.
+		s.allowGeneratorFunc = false
 
 		if len(t.Exprs) != 1 {
 			break
@@ -680,8 +754,8 @@ func (s *scope) replaceSubquery(sub *tree.Subquery, multiRow bool, desiredColumn
 	outScope := s.builder.buildStmt(sub.Select, s)
 
 	// Treat the subquery result as an anonymous data source (i.e. column names
-	// are not qualified). Remove any hidden columns added by the subquery's
-	// ORDER BY clause.
+	// are not qualified). Remove hidden columns, as they are not accessible
+	// outside the subquery.
 	outScope.setTableAlias("")
 	outScope.removeHiddenCols()
 
@@ -695,6 +769,14 @@ func (s *scope) replaceSubquery(sub *tree.Subquery, multiRow bool, desiredColumn
 			panic(builderError{pgerror.NewErrorf(pgerror.CodeSyntaxError,
 				"subquery must return %d columns, found %d", desiredColumns, n)})
 		}
+	}
+
+	if outScope.hasExtraOrderByCols() {
+		// We need to add a projection to remove the ORDER BY columns.
+		projScope := outScope.push()
+		projScope.appendColumns(outScope)
+		projScope.group = s.builder.constructProject(outScope.group, projScope.cols)
+		outScope = projScope
 	}
 
 	return &subquery{

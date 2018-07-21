@@ -56,6 +56,13 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 	tc.qualifyTableName(tn)
 
 	tab := &Table{Name: *tn}
+
+	// Assume that every table in the "system" catalog is a virtual table. This
+	// is a simplified assumption for testing purposes.
+	if tn.CatalogName == "system" {
+		tab.IsVirtual = true
+	}
+
 	// Add the columns.
 	for _, def := range stmt.Defs {
 		switch def := def.(type) {
@@ -81,7 +88,7 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 	}
 
 	// If there is no primary index, add the hidden rowid column.
-	if len(tab.Indexes) == 0 {
+	if len(tab.Indexes) == 0 && !tab.IsVirtual {
 		rowid := &Column{Name: "rowid", Type: types.Int, Hidden: true}
 		tab.Columns = append(tab.Columns, rowid)
 		tab.addPrimaryColumnIndex(rowid.Name)
@@ -109,33 +116,6 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 	return tab
 }
 
-// qualifyTableName updates the given table name to include catalog and schema
-// if not already included.
-func (tc *Catalog) qualifyTableName(name *tree.TableName) {
-	if name.ExplicitSchema {
-		if name.ExplicitCatalog {
-			// Already 3 parts: nothing to do.
-			return
-		}
-
-		if name.SchemaName == tree.PublicSchemaName {
-			// Use the current database.
-			name.CatalogName = testDB
-			return
-		}
-
-		// Compatibility with CockroachDB v1.1: use D.public.T.
-		name.CatalogName = name.SchemaName
-		name.SchemaName = tree.PublicSchemaName
-		name.ExplicitCatalog = true
-		return
-	}
-
-	// Use the current database.
-	name.CatalogName = testDB
-	name.SchemaName = tree.PublicSchemaName
-}
-
 func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 	nullable := !def.PrimaryKey && def.Nullable.Nullability != tree.NotNull
 	typ := coltypes.CastTargetToDatumType(def.Type)
@@ -144,7 +124,10 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 }
 
 func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) {
-	idx := &Index{Name: tt.makeIndexName(def.Name, typ)}
+	idx := &Index{
+		Name:     tt.makeIndexName(def.Name, typ),
+		Inverted: def.Inverted,
+	}
 
 	// Add explicit columns and mark primary key columns as not null.
 	notNullIndex := true

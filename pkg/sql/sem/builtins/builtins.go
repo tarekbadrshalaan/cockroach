@@ -63,6 +63,9 @@ var (
 	errLogOfNegNumber   = pgerror.NewError(pgerror.CodeInvalidArgumentForLogarithmError, "cannot take logarithm of a negative number")
 	errLogOfZero        = pgerror.NewError(pgerror.CodeInvalidArgumentForLogarithmError, "cannot take logarithm of zero")
 	errZeroIP           = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "zero length IP")
+	errChrValueTooSmall = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "input value must be >= 0")
+	errChrValueTooLarge = pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError,
+		"input value must be <= %d (maximum Unicode code point)", utf8.MaxRune)
 )
 
 const errInsufficientArgsFmtString = "unknown signature: %s()"
@@ -132,6 +135,16 @@ func makeBuiltin(props tree.FunctionProperties, overloads ...tree.Overload) buil
 		props:     props,
 		overloads: overloads,
 	}
+}
+
+func newDecodeError(enc string) error {
+	return pgerror.NewErrorf(pgerror.CodeCharacterNotInRepertoireError,
+		"invalid byte sequence for encoding %q", enc)
+}
+
+func newEncodeError(c rune, enc string) error {
+	return pgerror.NewErrorf(pgerror.CodeUntranslatableCharacterError,
+		"character %q has no representation in encoding %q", c, enc)
 }
 
 // builtins contains the built-in functions indexed by name.
@@ -242,6 +255,68 @@ var builtins = map[string]builtinDefinition{
 				"returns `wow!great`.",
 		},
 	),
+
+	// https://www.postgresql.org/docs/10/static/functions-string.html#FUNCTIONS-STRING-OTHER
+	"convert_from": makeBuiltin(tree.FunctionProperties{Category: categoryString},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"str", types.Bytes}, {"enc", types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				str := []byte(tree.MustBeDBytes(args[0]))
+				enc := strings.ToLower(string(tree.MustBeDString(args[1])))
+				switch enc {
+				// All the following are aliases to each other in PostgreSQL.
+				case "utf8", "utf-8", "unicode", "cp65001":
+					if !utf8.Valid(str) {
+						return nil, newDecodeError("UTF8")
+					}
+					return tree.NewDString(string(str)), nil
+
+					// All the following are aliases to each other in PostgreSQL.
+				case "latin1", "latin-1", "iso88591", "iso8859-1", "iso-8859-1", "cp28591":
+					var buf strings.Builder
+					for _, c := range str {
+						buf.WriteRune(rune(c))
+					}
+					return tree.NewDString(buf.String()), nil
+				}
+				return nil, pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError,
+					"invalid source encoding name %q", enc)
+			},
+			Info: "Decode the bytes in `str` into a string using encoding `enc`. " +
+				"Supports encodings 'UTF8' and 'LATIN1'.",
+		}),
+
+	// https://www.postgresql.org/docs/10/static/functions-string.html#FUNCTIONS-STRING-OTHER
+	"convert_to": makeBuiltin(tree.FunctionProperties{Category: categoryString},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"str", types.String}, {"enc", types.String}},
+			ReturnType: tree.FixedReturnType(types.Bytes),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				str := string(tree.MustBeDString(args[0]))
+				enc := strings.ToLower(string(tree.MustBeDString(args[1])))
+				switch enc {
+				// All the following are aliases to each other in PostgreSQL.
+				case "utf8", "utf-8", "unicode", "cp65001":
+					return tree.NewDBytes(tree.DBytes([]byte(str))), nil
+
+					// All the following are aliases to each other in PostgreSQL.
+				case "latin1", "latin-1", "iso88591", "iso8859-1", "iso-8859-1", "cp28591":
+					res := make([]byte, 0, len(str))
+					for _, c := range str {
+						if c > 255 {
+							return nil, newEncodeError(c, "LATIN1")
+						}
+						res = append(res, byte(c))
+					}
+					return tree.NewDBytes(tree.DBytes(res)), nil
+				}
+				return nil, pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError,
+					"invalid destination encoding name %q", enc)
+			},
+			Info: "Encode the string `str` as a byte array using encoding `enc`. " +
+				"Supports encodings 'UTF8' and 'LATIN1'.",
+		}),
 
 	"gen_random_uuid": makeBuiltin(
 		tree.FunctionProperties{
@@ -660,7 +735,28 @@ var builtins = map[string]builtinDefinition{
 				return tree.NewDInt(tree.DInt(ch)), nil
 			}
 			return nil, errEmptyInputString
-		}, types.Int, "Calculates the ASCII value for the first character in `val`.")),
+		}, types.Int, "Returns the character code of the first character in `val`. Despite the name, the function supports Unicode too.")),
+
+	"chr": makeBuiltin(tree.FunctionProperties{Category: categoryString},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"val", types.Int}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				x := tree.MustBeDInt(args[0])
+				var answer string
+				switch {
+				case x < 0:
+					return nil, errChrValueTooSmall
+				case x > utf8.MaxRune:
+					return nil, errChrValueTooLarge
+				default:
+					answer = string(rune(x))
+				}
+				return tree.NewDString(answer), nil
+			},
+			Info: "Returns the character with the code given in `val`. Inverse function of `ascii()`.",
+		},
+	),
 
 	"md5": hashBuiltin(
 		func() hash.Hash { return md5.New() },

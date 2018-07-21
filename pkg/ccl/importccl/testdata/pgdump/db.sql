@@ -15,12 +15,40 @@ SET check_function_bodies = false;
 SET client_min_messages = warning;
 SET row_security = off;
 
+--
+-- Name: plpgsql; Type: EXTENSION; Schema: -; Owner: 
+--
+
+CREATE EXTENSION IF NOT EXISTS plpgsql WITH SCHEMA pg_catalog;
+
+
+--
+-- Name: EXTENSION plpgsql; Type: COMMENT; Schema: -; Owner: 
+--
+
+COMMENT ON EXTENSION plpgsql IS 'PL/pgSQL procedural language';
+
+
+--
+-- Name: a_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.a_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.a_seq OWNER TO postgres;
+
 SET default_tablespace = '';
 
 SET default_with_oids = false;
 
 --
--- Name: second; Type: TABLE; Schema: public; Owner: -
+-- Name: second; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.second (
@@ -29,8 +57,22 @@ CREATE TABLE public.second (
 );
 
 
+ALTER TABLE public.second OWNER TO postgres;
+
 --
--- Name: simple; Type: TABLE; Schema: public; Owner: -
+-- Name: seqtable; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.seqtable (
+    a integer DEFAULT nextval('public.a_seq'::regclass),
+    b integer
+);
+
+
+ALTER TABLE public.seqtable OWNER TO postgres;
+
+--
+-- Name: simple; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.simple (
@@ -40,8 +82,17 @@ CREATE TABLE public.simple (
 );
 
 
+ALTER TABLE public.simple OWNER TO postgres;
+
 --
--- Data for Name: second; Type: TABLE DATA; Schema: public; Owner: -
+-- Name: a_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.a_seq', 7, true);
+
+
+--
+-- Data for Name: second; Type: TABLE DATA; Schema: public; Owner: postgres
 --
 
 COPY public.second (i, s) FROM stdin;
@@ -56,7 +107,22 @@ COPY public.second (i, s) FROM stdin;
 
 
 --
--- Data for Name: simple; Type: TABLE DATA; Schema: public; Owner: -
+-- Data for Name: seqtable; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.seqtable (a, b) FROM stdin;
+1	0
+2	10
+3	20
+4	30
+5	40
+6	50
+7	60
+\.
+
+
+--
+-- Data for Name: simple; Type: TABLE DATA; Schema: public; Owner: postgres
 --
 
 COPY public.simple (i, s, b) FROM stdin;
@@ -93,7 +159,7 @@ COPY public.simple (i, s, b) FROM stdin;
 
 
 --
--- Name: second second_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: second second_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.second
@@ -101,7 +167,7 @@ ALTER TABLE ONLY public.second
 
 
 --
--- Name: simple simple_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: simple simple_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.simple
@@ -109,14 +175,14 @@ ALTER TABLE ONLY public.simple
 
 
 --
--- Name: simple_b_s_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: simple_b_s_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE UNIQUE INDEX simple_b_s_idx ON public.simple USING btree (b, s);
 
 
 --
--- Name: simple_s_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: simple_s_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX simple_s_idx ON public.simple USING btree (s);

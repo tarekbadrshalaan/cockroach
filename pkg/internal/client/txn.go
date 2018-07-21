@@ -170,13 +170,23 @@ func NewTxn(db *DB, gatewayNodeID roachpb.NodeID, typ TxnType) *Txn {
 func NewTxnWithProto(
 	db *DB, gatewayNodeID roachpb.NodeID, typ TxnType, proto roachpb.Transaction,
 ) *Txn {
+	meta := roachpb.MakeTxnCoordMeta(proto)
+	return NewTxnWithCoordMeta(db, gatewayNodeID, typ, meta)
+}
+
+// NewTxnWithCoordMeta is like NewTxn, except it returns a new txn with the
+// provided TxnCoordMeta. This allows a client.Txn to be created with an already
+// initialized proto and TxnCoordSender.
+func NewTxnWithCoordMeta(
+	db *DB, gatewayNodeID roachpb.NodeID, typ TxnType, meta roachpb.TxnCoordMeta,
+) *Txn {
 	if db == nil {
-		log.Fatalf(context.TODO(), "attempting to create txn with nil db for Transaction: %s", proto)
+		log.Fatalf(context.TODO(), "attempting to create txn with nil db for Transaction: %s", meta.Txn)
 	}
-	proto.AssertInitialized(context.TODO())
+	meta.Txn.AssertInitialized(context.TODO())
 	txn := &Txn{db: db, typ: typ, gatewayNodeID: gatewayNodeID}
-	txn.mu.Proto = proto
-	txn.mu.sender = db.factory.TransactionalSender(typ, &proto)
+	txn.mu.Proto = meta.Txn
+	txn.mu.sender = db.factory.TransactionalSender(typ, meta)
 	return txn
 }
 
@@ -503,7 +513,7 @@ func (txn *Txn) Iterate(
 	for {
 		rows, err := txn.Scan(ctx, begin, end, int64(pageSize))
 		if err != nil {
-			return errors.Wrap(err, "scanning meta2 keys")
+			return err
 		}
 		if len(rows) == 0 {
 			return nil
@@ -628,8 +638,10 @@ func (txn *Txn) CommitOrCleanup(ctx context.Context) error {
 //
 // The deadline cannot be lower than txn.OrigTimestamp.
 func (txn *Txn) UpdateDeadlineMaybe(ctx context.Context, deadline hlc.Timestamp) bool {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
 	if txn.deadline == nil || deadline.Less(*txn.deadline) {
-		if deadline.Less(txn.OrigTimestamp()) {
+		if deadline.Less(txn.mu.Proto.OrigTimestamp) {
 			log.Fatalf(ctx, "deadline below txn.OrigTimestamp is nonsensical; "+
 				"txn has would have no change to commit. Deadline: %s, txn: %s",
 				deadline, txn.Proto())
@@ -640,8 +652,8 @@ func (txn *Txn) UpdateDeadlineMaybe(ctx context.Context, deadline hlc.Timestamp)
 	return false
 }
 
-// resetDeadline resets the deadline.
-func (txn *Txn) resetDeadline() {
+// resetDeadlineLocked resets the deadline.
+func (txn *Txn) resetDeadlineLocked() {
 	txn.deadline = nil
 }
 
@@ -1198,6 +1210,23 @@ func (txn *Txn) GetTxnCoordMeta() roachpb.TxnCoordMeta {
 	return txn.mu.sender.GetMeta()
 }
 
+// GetStrippedTxnCoordMeta is like GetTxnCoordMeta, but it strips out all
+// information that is unnecessary to communicate to other distributed
+// transaction coordinators that are all operating on the same transaction.
+func (txn *Txn) GetStrippedTxnCoordMeta() roachpb.TxnCoordMeta {
+	meta := txn.GetTxnCoordMeta()
+	switch txn.typ {
+	case RootTxn:
+		meta.Intents = nil
+		meta.CommandCount = 0
+		meta.RefreshReads = nil
+		meta.RefreshWrites = nil
+	case LeafTxn:
+		meta.OutstandingWrites = nil
+	}
+	return meta
+}
+
 // AugmentTxnCoordMeta augments this transaction's TxnCoordMeta
 // information with the supplied meta. For use with GetTxnCoordMeta().
 func (txn *Txn) AugmentTxnCoordMeta(ctx context.Context, meta roachpb.TxnCoordMeta) {
@@ -1262,7 +1291,7 @@ func (txn *Txn) BumpEpochAfterConcurrentRetryErrorLocked() {
 func (txn *Txn) updateStateOnRetryableErrLocked(
 	ctx context.Context, retryErr *roachpb.HandledRetryableTxnError,
 ) {
-	txn.resetDeadline()
+	txn.resetDeadlineLocked()
 	newTxn := &retryErr.Transaction
 
 	abortErr := txn.mu.Proto.ID != newTxn.ID
@@ -1282,7 +1311,8 @@ func (txn *Txn) updateStateOnRetryableErrLocked(
 		txn.mu.state = txnReadOnly
 
 		// Create a new txn sender.
-		txn.mu.sender = txn.db.factory.TransactionalSender(txn.typ, newTxn)
+		meta := roachpb.MakeTxnCoordMeta(*newTxn)
+		txn.mu.sender = txn.db.factory.TransactionalSender(txn.typ, meta)
 	} else {
 		// Update the transaction proto with the one to be used for the next
 		// attempt. The txn inside pErr was correctly prepared for this by
@@ -1334,7 +1364,7 @@ func (txn *Txn) SetFixedTimestamp(ctx context.Context, ts hlc.Timestamp) {
 // unfortunately its callers don't currently have that handy.
 func (txn *Txn) GenerateForcedRetryableError(msg string) error {
 	txn.Proto().Restart(txn.UserPriority(), 0 /* upgradePriority */, txn.Proto().Timestamp)
-	txn.resetDeadline()
+	txn.resetDeadlineLocked()
 	return roachpb.NewHandledRetryableTxnError(
 		msg,
 		txn.ID(),

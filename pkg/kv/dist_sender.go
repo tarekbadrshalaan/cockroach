@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
@@ -163,6 +164,7 @@ type DistSender struct {
 	leaseHolderCache *LeaseHolderCache
 	transportFactory TransportFactory
 	rpcContext       *rpc.Context
+	nodeDialer       *nodedialer.Dialer
 	rpcRetryOptions  retry.Options
 	asyncSenderSem   chan struct{}
 }
@@ -234,6 +236,7 @@ func NewDistSender(cfg DistSenderConfig, g *gossip.Gossip) *DistSender {
 			ds.rpcRetryOptions.Closer = ds.rpcContext.Stopper.ShouldQuiesce()
 		}
 	}
+	ds.nodeDialer = nodedialer.New(ds.rpcContext, gossip.AddressResolver(g))
 	ds.asyncSenderSem = make(chan struct{}, defaultSenderConcurrency)
 
 	if g != nil {
@@ -361,7 +364,7 @@ func (ds *DistSender) sendRPC(
 	tracing.AnnotateTrace()
 	defer tracing.AnnotateTrace()
 
-	return ds.sendToReplicas(ctx, SendOptions{metrics: &ds.metrics}, rangeID, replicas, ba, ds.rpcContext)
+	return ds.sendToReplicas(ctx, SendOptions{metrics: &ds.metrics}, rangeID, replicas, ba, ds.nodeDialer)
 }
 
 // CountRanges returns the number of ranges that encompass the given key span.
@@ -483,7 +486,7 @@ func (ds *DistSender) initAndVerifyBatch(
 					return roachpb.NewErrorf("batch with limit contains both forward and reverse scans")
 				}
 
-			case *roachpb.ResolveIntentRangeRequest:
+			case *roachpb.QueryIntentRequest, *roachpb.ResolveIntentRangeRequest:
 				continue
 
 			case *roachpb.BeginTransactionRequest, *roachpb.EndTransactionRequest, *roachpb.ReverseScanRequest:
@@ -633,11 +636,8 @@ func (ds *DistSender) Send(
 				panic("EndTransaction not in last chunk of batch")
 			}
 			parts = splitBatchAndCheckForRefreshSpans(ba, true /* split ET */)
-			if len(parts) != 2 {
-				panic("split of final EndTransaction chunk resulted in != 2 parts")
-			}
-			// Restart transaction of the last chunk as two parts
-			// with EndTransaction in the second part.
+			// Restart transaction of the last chunk as multiple parts
+			// with EndTransaction in the last part.
 			continue
 		}
 		if pErr != nil {
@@ -741,7 +741,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 			// If we're in the middle of a panic, don't wait on responseChs.
 			panic(r)
 		}
-		var hadSuccess bool
+		var hadSuccessWriting bool
 		for _, responseCh := range responseChs {
 			resp := <-responseCh
 			if resp.pErr != nil {
@@ -750,7 +750,15 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 				}
 				continue
 			}
-			hadSuccess = true
+			if !hadSuccessWriting {
+				for _, i := range resp.positions {
+					req := ba.Requests[i].GetInner()
+					if !roachpb.IsReadOnly(req) {
+						hadSuccessWriting = true
+						break
+					}
+				}
+			}
 
 			// Combine the new response with the existing one (including updating
 			// the headers).
@@ -775,7 +783,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 			// If this is a write batch with any successful responses, but
 			// we're ultimately returning an error, wrap the error with a
 			// MixedSuccessError.
-			if hadSuccess && ba.IsWrite() {
+			if hadSuccessWriting {
 				pErr = roachpb.NewError(&roachpb.MixedSuccessError{Wrapped: pErr})
 			}
 		} else if couldHaveSkippedResponses {
@@ -1226,7 +1234,7 @@ func (ds *DistSender) sendToReplicas(
 	rangeID roachpb.RangeID,
 	replicas ReplicaSlice,
 	args roachpb.BatchRequest,
-	rpcContext *rpc.Context,
+	nodeDialer *nodedialer.Dialer,
 ) (*roachpb.BatchResponse, error) {
 	var ambiguousError error
 	var haveCommit bool
@@ -1236,7 +1244,7 @@ func (ds *DistSender) sendToReplicas(
 		haveCommit = etArg.(*roachpb.EndTransactionRequest).Commit
 	}
 
-	transport, err := ds.transportFactory(opts, rpcContext, replicas, args)
+	transport, err := ds.transportFactory(opts, nodeDialer, replicas, args)
 	if err != nil {
 		return nil, err
 	}

@@ -7,7 +7,7 @@ CREATE TABLE t (k INT PRIMARY KEY, v INT, w INT, INDEX(v))
 query TTTTT colnames
 EXPLAIN (VERBOSE) SELECT * FROM t WHERE v > 4 AND v < 8 AND w > 30 ORDER BY v LIMIT 2
 ----
-Tree                  Field   Description  Columns    Ordering
+tree                  field   description  columns    ordering
 limit                 ·       ·            (k, v, w)  ·
  │                    count   2            ·          ·
  └── filter           ·       ·            (k, v, w)  ·
@@ -25,7 +25,7 @@ limit                 ·       ·            (k, v, w)  ·
 query TTTTT colnames
 EXPLAIN (VERBOSE) SELECT DISTINCT w FROM (SELECT w FROM t ORDER BY w LIMIT 100) ORDER BY w LIMIT 25
 ----
-Tree                           Field        Description  Columns  Ordering
+tree                           field        description  columns  ordering
 limit                          ·            ·            (w)      +w
  │                             count        25           ·        ·
  └── sort                      ·            ·            (w)      +w
@@ -81,20 +81,20 @@ limit         ·       ·          (k, v)  -v
 query TTTTT
 EXPLAIN (VERBOSE) SELECT sum(w) FROM t GROUP BY k, v ORDER BY v DESC LIMIT 10
 ----
-render                    ·            ·          (sum)         ·
- │                        render 0     agg0       ·             ·
- └── limit                ·            ·          (k, v, agg0)  -v
-      │                   count        10         ·             ·
-      └── sort            ·            ·          (k, v, agg0)  -v
-           │              order        -v         ·             ·
-           └── group      ·            ·          (k, v, agg0)  ·
-                │         aggregate 0  k          ·             ·
-                │         aggregate 1  v          ·             ·
-                │         aggregate 2  sum(w)     ·             ·
-                │         group by     @1-@2      ·             ·
-                └── scan  ·            ·          (k, v, w)     ·
-·                         table        t@primary  ·             ·
-·                         spans        ALL        ·             ·
+render                    ·            ·                (sum)            ·
+ │                        render 0     agg0             ·                ·
+ └── limit                ·            ·                (k, agg0, agg1)  -agg1
+      │                   count        10               ·                ·
+      └── sort            ·            ·                (k, agg0, agg1)  -agg1
+           │              order        -agg1            ·                ·
+           └── group      ·            ·                (k, agg0, agg1)  ·
+                │         aggregate 0  k                ·                ·
+                │         aggregate 1  sum(w)           ·                ·
+                │         aggregate 2  any_not_null(v)  ·                ·
+                │         group by     @1               ·                ·
+                └── scan  ·            ·                (k, v, w)        ·
+·                         table        t@primary        ·                ·
+·                         spans        ALL              ·                ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT k FROM (SELECT k, v FROM t ORDER BY v LIMIT 4)

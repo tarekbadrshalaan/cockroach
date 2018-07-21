@@ -111,6 +111,7 @@ const (
 	isRange                    // range commands may span multiple keys
 	isReverse                  // reverse commands traverse ranges in descending direction
 	isAlone                    // requests which must be alone in a batch
+	isPrefix                   // requests which should be grouped with the next request in a batch
 	isUnsplittable             // range command that must not be split during sending
 	// Requests for acquiring a lease skip the (proposal-time) check that the
 	// proposing replica has a valid lease.
@@ -126,6 +127,12 @@ const (
 func IsReadOnly(args Request) bool {
 	flags := args.flags()
 	return (flags&isRead) != 0 && (flags&isWrite) == 0
+}
+
+// IsTransactional returns true if the request may be part of a
+// transaction.
+func IsTransactional(args Request) bool {
+	return (args.flags() & isTxn) != 0
 }
 
 // IsTransactionWrite returns true if the request produces write
@@ -384,12 +391,6 @@ func (h *BatchResponse_Header) combine(o BatchResponse_Header) error {
 	return nil
 }
 
-// Header implements the Request interface.
-func (*NoopRequest) Header() RequestHeader { panic("NoopRequest has no span") }
-
-// SetHeader implements the Request interface.
-func (*NoopRequest) SetHeader(_ RequestHeader) { panic("NoopRequest has no span") }
-
 // SetHeader implements the Response interface.
 func (rh *ResponseHeader) SetHeader(other ResponseHeader) {
 	*rh = other
@@ -399,12 +400,6 @@ func (rh *ResponseHeader) SetHeader(other ResponseHeader) {
 func (rh ResponseHeader) Header() ResponseHeader {
 	return rh
 }
-
-// Header implements the Response interface.
-func (*NoopResponse) Header() ResponseHeader { return ResponseHeader{} }
-
-// SetHeader implements the Response interface.
-func (*NoopResponse) SetHeader(_ ResponseHeader) {}
 
 // Verify implements the Response interface for ResopnseHeader with a
 // default noop. Individual response types should override this method
@@ -438,11 +433,6 @@ func (sr *ReverseScanResponse) Verify(req Request) error {
 			return err
 		}
 	}
-	return nil
-}
-
-// Verify implements the Response interface.
-func (*NoopResponse) Verify(_ Request) error {
 	return nil
 }
 
@@ -537,9 +527,6 @@ func (*ResolveIntentRequest) Method() Method { return ResolveIntent }
 
 // Method implements the Request interface.
 func (*ResolveIntentRangeRequest) Method() Method { return ResolveIntentRange }
-
-// Method implements the Request interface.
-func (*NoopRequest) Method() Method { return Noop }
 
 // Method implements the Request interface.
 func (*MergeRequest) Method() Method { return Merge }
@@ -727,12 +714,6 @@ func (rir *ResolveIntentRequest) ShallowCopy() Request {
 // ShallowCopy implements the Request interface.
 func (rirr *ResolveIntentRangeRequest) ShallowCopy() Request {
 	shallowCopy := *rirr
-	return &shallowCopy
-}
-
-// ShallowCopy implements the Request interface.
-func (nr *NoopRequest) ShallowCopy() Request {
-	shallowCopy := *nr
 	return &shallowCopy
 }
 
@@ -1043,10 +1024,9 @@ func (*QueryTxnRequest) flags() int            { return isRead | isAlone }
 // QueryIntent only updates the read timestamp cache when attempting
 // to prevent an intent that is found missing from ever being written
 // in the future. See QueryIntentRequest_PREVENT.
-func (*QueryIntentRequest) flags() int        { return isRead | updatesReadTSCache }
+func (*QueryIntentRequest) flags() int        { return isRead | isPrefix | updatesReadTSCache }
 func (*ResolveIntentRequest) flags() int      { return isWrite }
 func (*ResolveIntentRangeRequest) flags() int { return isWrite | isRange }
-func (*NoopRequest) flags() int               { return isRead } // slightly special
 func (*TruncateLogRequest) flags() int        { return isWrite }
 func (*MergeRequest) flags() int              { return isWrite }
 
@@ -1087,7 +1067,7 @@ func (*AddSSTableRequest) flags() int       { return isWrite | isAlone | isRange
 func (*RefreshRequest) flags() int      { return isRead | isTxn | updatesReadTSCache }
 func (*RefreshRangeRequest) flags() int { return isRead | isTxn | isRange | updatesReadTSCache }
 
-func (*GetSnapshotForMergeRequest) flags() int { return isRead | updatesReadTSCache }
+func (*GetSnapshotForMergeRequest) flags() int { return isRead | isAlone | updatesReadTSCache }
 
 // Keys returns credentials in an aws.Config.
 func (b *ExportStorage_S3) Keys() *aws.Config {
